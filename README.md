@@ -1,9 +1,19 @@
-# daily-task-agent
+# my-agents
 
-前日のメールから「今日やることリスト」を作成し、自分宛に送信する Google Apps Script エージェント。
+Google Apps Script で動く、いくつかの自動化エージェントをまとめたリポジトリ。
 
 GitHub の `main` ブランチに push すると、GitHub Actions が [clasp](https://github.com/google/clasp) 経由で
-自動的に Google Apps Script プロジェクトへデプロイします(実行自体は Google Apps Script のトリガーが担当します)。
+自動的に(同じ)Google Apps Script プロジェクトへデプロイします(実行自体は各エージェントの
+Google Apps Script トリガーが担当します)。
+
+## エージェント一覧
+
+- `daily-task-agent.gs` — 前日のメールから「今日やることリスト」を作成し、自分宛に送信
+- `fb-draft-post-agent.gs` — 毎朝、ふくしま市場([fukushima-ichiba.com](https://fukushima-ichiba.com/))の
+  新着・売れ筋商品と当日の話題を絡めたFacebook投稿文をGeminiで生成し、
+  Facebookページ([facebook.com/fukushimaichiba](https://www.facebook.com/fukushimaichiba/))に
+  **下書き(未公開投稿)として保存**する。自動公開はせず、Meta Business Suiteで内容確認後に手動公開する。
+  セットアップ手順はファイル冒頭のコメントを参照。
 
 ## セットアップ(初回のみ・手元の端末で実施)
 
@@ -41,7 +51,18 @@ GitHub の `main` ブランチに push すると、GitHub Actions が [clasp](ht
    - エディタの関数選択で `setupDailyTrigger` を選んで実行(初回は権限承認あり)
    - 「トリガー」画面で `sendDailyTaskList` が毎日7:00に登録されていることを確認
 
-6. GitHub Actions 用の Secrets を登録
+6. `fb-draft-post-agent.gs` を使う場合は、追加でスクリプトプロパティに
+   `FB_PAGE_ID` / `FB_PAGE_ACCESS_TOKEN` を設定し、
+   関数選択で `setupFacebookDraftTrigger` を実行して毎朝8:30のトリガーを作成する
+   - トークンの取得は、fukushimaichibaページの管理者アカウントで
+     [Graph API Explorer](https://developers.facebook.com/tools/explorer/)(Meta純正のデフォルトアプリ、
+     自分でアプリを作る必要なし)を開き、権限に `pages_show_list` / `pages_manage_posts` /
+     `pages_read_engagement` を追加してトークン取得 → `GET /me/accounts` でページID・
+     ページアクセストークンを確認、という流れ(詳細はファイル冒頭のコメント参照)
+   - このトークンは60日程度で失効するため、失効時は同じ手順で取り直して
+     `FB_PAGE_ACCESS_TOKEN` を更新する(失効時は失敗通知メールが届きます)
+
+7. GitHub Actions 用の Secrets を登録
    ```
    gh secret set CLASP_CREDENTIALS < ~/.clasprc.json
    gh secret set CLASP_SCRIPT_ID -b"<.clasp.json の scriptId>"
@@ -49,7 +70,8 @@ GitHub の `main` ブランチに push すると、GitHub Actions が [clasp](ht
 
 ## 以降の運用
 
-- `daily-task-agent.gs` を編集して `main` に push すると、GitHub Actions が自動で
+- 各 `.gs` ファイルを編集して `main` に push すると、GitHub Actions が自動で
   Apps Script プロジェクトへ反映します(`.github/workflows/deploy.yml`)。
-- 実際の毎日の実行(メール収集・Gemini呼び出し・送信)は Apps Script 側の時間主導トリガー
-  (`setupDailyTrigger` で登録済み)が担当します。GitHub Actions は「コードを最新に保つ」役割です。
+- 実際の毎日の実行は Apps Script 側の時間主導トリガー
+  (`setupDailyTrigger` / `setupFacebookDraftTrigger` で登録済み)が担当します。
+  GitHub Actions は「コードを最新に保つ」役割です。

@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "daily-task-agent.gs"
+      - "fb-draft-post-agent.gs"
       - "appsscript.json"
       - ".github/workflows/deploy.yml"
   workflow_dispatch: {}
