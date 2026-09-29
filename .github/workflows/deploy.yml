@@ -24,10 +24,14 @@ jobs:
         run: npm install -g @google/clasp
 
       - name: Restore clasp credentials
-        run: echo "${{ secrets.CLASP_CREDENTIALS }}" > ~/.clasprc.json
+        env:
+          CLASP_CREDENTIALS: ${{ secrets.CLASP_CREDENTIALS }}
+        run: echo "$CLASP_CREDENTIALS" > ~/.clasprc.json
 
       - name: Write .clasp.json
-        run: echo '{"scriptId":"${{ secrets.CLASP_SCRIPT_ID }}"}' > .clasp.json
+        env:
+          CLASP_SCRIPT_ID: ${{ secrets.CLASP_SCRIPT_ID }}
+        run: printf '{"scriptId":"%s"}' "$CLASP_SCRIPT_ID" > .clasp.json
 
       - name: Push to Apps Script
         run: clasp push -f
