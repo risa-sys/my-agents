@@ -20,31 +20,41 @@
  *      - FB_PAGE_ID             : 対象Facebookページの数値ページID
  *      - FB_PAGE_ACCESS_TOKEN   : そのページに投稿できるページアクセストークン
  *
- *    ページID・アクセストークンの取得方法(初回のみ、手元のブラウザで、
- *    fukushimaichiba ページの管理者アカウントでログインして実施。
- *    自分でMetaアプリを作る必要はなく、Meta純正の「Graph API Explorer」
- *    デフォルトアプリを使うだけでよい):
- *      a. https://developers.facebook.com/tools/explorer/ を開く
- *      b. 画面上部の「Meta App」欄が "Graph API Explorer"(デフォルトアプリ)に
- *         なっていることを確認(自分でアプリを作成・選択する必要はない)
- *      c. 「User or Page」→ fukushimaichiba ページの管理者アカウントで
- *         Facebookにログイン
- *      d. 「Permissions」に pages_show_list, pages_manage_posts,
- *         pages_read_engagement を追加し、「Generate Access Token」で
- *         ユーザートークンを取得
- *      e. 同じExplorer上で `GET /me/accounts` を実行し、
- *         対象ページ(fukushimaichiba)の "id"(=FB_PAGE_ID)と
- *         "access_token"(=ページアクセストークン)を確認
- *      f. 取得したページアクセストークンは
- *         https://developers.facebook.com/tools/debug/accesstoken/ に貼り付け、
- *         「トークンを長期化(Extend Access Token)」で有効期限を延ばしておく
+ *    ページID・アクセストークンの取得方法(初回のみ、Business Managerの
+ *    管理者権限で実施。Meta Business Suiteの「システムユーザー」を使い、
+ *    有効期限「なし(Never)」のトークンを発行する方式):
+ *      a. https://business.facebook.com/settings を開き、対象の
+ *         ビジネスポートフォリオ(スペースワン)を選ぶ
+ *      b. 左メニュー「ユーザー」→「システムユーザー」を開く。
+ *         既存のシステムユーザーがあればそれを使う。無ければ「追加」で作成
+ *         (名前例: fukushimaichiba-bot、役割は「管理者」か「従業員」)
+ *      c. システムユーザーを選択 →「アセットを割り当てる」を開き、
+ *         - ページ: fukushimaichiba を選び「コンテンツの作成・管理」権限
+ *           (またはフルコントロール)を付与
+ *         - アプリ: 投稿に使うMetaアプリを選び「アプリを管理」権限を付与
+ *           (アプリが無ければ developers.facebook.com で作成しておく)
+ *      d. 同じ画面で「新しいトークンを生成」→ アプリを選択 →
+ *         トークンの有効期限は必ず「なし(Never)」を選択 →
+ *         権限に pages_manage_posts, pages_read_engagement, pages_show_list
+ *         をチェック → 生成されたトークンをコピー(この画面でしか表示されない)
+ *      e. https://developers.facebook.com/tools/debug/accesstoken/ に
+ *         コピーしたトークンを貼り付け、次の3点を確認する
+ *           - Expires(有効期限)が Never
+ *           - Scopes に上記3つの権限が入っている
+ *           - 「有効」と表示される
+ *      f. Graph API Explorer等で `GET /me/accounts` を実行し、
+ *         fukushimaichibaページの "id"(=FB_PAGE_ID)を確認する
+ *      → 取得した FB_PAGE_ID / トークン(=FB_PAGE_ACCESS_TOKEN)を
+ *        Apps Scriptのスクリプトプロパティに設定する
  *
- *    注意: この方法で取得したトークンは60日程度で失効します。切れると
- *    createFacebookDraftPost がGraph APIエラーで失敗するので、その際は
- *    上記a〜fを再実行してFB_PAGE_ACCESS_TOKENを更新してください
- *    (「切れると自動投稿が止まる/失敗メールも飛ばない」点に注意。
- *    完全放置したい場合はMeta Business Suiteの「システムユーザー」を使った
- *    無期限トークンへの切り替えを検討してください)
+ *    この方式で発行したトークンは失効しないため、以後の再取得は基本不要。
+ *    それでもエラーになる場合は:
+ *      - エラー190(トークン無効・期限切れ) → 手順dからやり直す
+ *      - エラー200/10(権限不足) → 手順cのアセット割り当てと
+ *        手順dの権限チェックを再確認する
+ *      - 投稿は成功したのにページに表示されない → Metaアプリが
+ *        「開発モード」のままの可能性がある。developers.facebook.com で
+ *        アプリを「ライブ」にする
  *
  * 3. 関数選択で setupFacebookDraftTrigger を選び、実行(▶)
  *    → 初回は権限承認画面(外部通信の許可)が出るので許可する
@@ -67,13 +77,18 @@ const FB_CONFIG = {
   GEMINI_MODEL: 'gemini-2.0-flash',
   GRAPH_API_VERSION: 'v21.0',
   SHOP_BASE_URL: 'https://fukushima-ichiba.com',
-  // 実在する商品だけを候補にするため、認証不要のShopify商品JSONを利用する
+  // 実在する商品だけを候補にするため、認証不要のShopify商品JSONを利用する。
+  // ranking_top10(売れ筋)を基準とし、new-1(新着)を補助的な候補として加える
   PRODUCT_SOURCE_PATHS: [
-    '/collections/new-1/products.json?limit=20',   // 新着
-    '/collections/ranking_top10/products.json?limit=20' // 売れ筋
+    '/collections/ranking_top10/products.json?limit=20', // 基準: 売れ筋ランキング
+    '/collections/new-1/products.json?limit=20'           // 補助: 新着
   ],
   PRODUCT_FALLBACK_PATH: '/products.json?limit=20',
-  MAX_CANDIDATE_PRODUCTS: 30
+  MAX_CANDIDATE_PRODUCTS: 30,
+  // 直近で紹介済みの商品と被らないようにするための履歴設定
+  HISTORY_PROPERTY_KEY: 'FB_POSTED_PRODUCT_HISTORY',
+  HISTORY_RETENTION_DAYS: 30, // ranking_top10が入れ替わる程度の期間を想定
+  HISTORY_MAX_ENTRIES: 60
 };
 
 /**
@@ -99,6 +114,7 @@ function createFacebookDraftPost() {
     const productUrl = `${FB_CONFIG.SHOP_BASE_URL}/products/${product.handle}`;
 
     const postId = createUnpublishedPagePost_(pageId, pageToken, draft.message, productUrl);
+    recordProductAsPosted_(product.handle);
 
     notifyDraftCreated_(draft, product, productUrl, postId);
   } catch (e) {
@@ -109,8 +125,10 @@ function createFacebookDraftPost() {
 }
 
 /**
- * ふくしま市場の新着・売れ筋商品をShopifyの公開JSONエンドポイントから取得し、
- * Geminiに渡すためのコンパクトな配列にまとめる(重複除去つき)。
+ * ふくしま市場の売れ筋・新着商品をShopifyの公開JSONエンドポイントから取得し、
+ * Geminiに渡すためのコンパクトな配列にまとめる(重複除去・紹介済み除外つき)。
+ * 直近 HISTORY_RETENTION_DAYS 日以内に紹介済みの商品は、ranking_top10が
+ * 入れ替わるまで候補から外し、同じ商品が続けて登場しないようにする。
  */
 function collectCandidateProducts_() {
   const byId = {};
@@ -123,7 +141,62 @@ function collectCandidateProducts_() {
     fetchShopifyProducts_(FB_CONFIG.PRODUCT_FALLBACK_PATH).forEach(p => { byId[p.id] = p; });
   }
 
-  return Object.values(byId).slice(0, FB_CONFIG.MAX_CANDIDATE_PRODUCTS);
+  const all = Object.values(byId);
+  const postedHandles = getPostedProductHandles_();
+  let candidates = all.filter(p => !postedHandles.has(p.handle));
+
+  if (candidates.length === 0) {
+    // ranking_top10 / new-1 が軒並み紹介済みの場合は、カタログ全体まで候補を広げる
+    const fallback = fetchShopifyProducts_(FB_CONFIG.PRODUCT_FALLBACK_PATH)
+      .filter(p => !postedHandles.has(p.handle));
+    candidates = fallback.length > 0 ? fallback : all; // それでも無ければ重複を許容する
+  }
+
+  return candidates.slice(0, FB_CONFIG.MAX_CANDIDATE_PRODUCTS);
+}
+
+/**
+ * 直近 HISTORY_RETENTION_DAYS 日以内に紹介済みの商品handle一覧を取得する。
+ */
+function getPostedProductHandles_() {
+  const raw = PropertiesService.getScriptProperties().getProperty(FB_CONFIG.HISTORY_PROPERTY_KEY);
+  if (!raw) return new Set();
+
+  let history;
+  try {
+    history = JSON.parse(raw);
+  } catch (e) {
+    return new Set();
+  }
+
+  const cutoff = Date.now() - FB_CONFIG.HISTORY_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  return new Set(
+    history.filter(entry => entry.postedAt >= cutoff).map(entry => entry.handle)
+  );
+}
+
+/**
+ * 紹介済み商品として履歴に記録する(期限切れ分は削除し、件数も上限まで間引く)。
+ */
+function recordProductAsPosted_(handle) {
+  const props = PropertiesService.getScriptProperties();
+  const raw = props.getProperty(FB_CONFIG.HISTORY_PROPERTY_KEY);
+
+  let history = [];
+  if (raw) {
+    try {
+      history = JSON.parse(raw);
+    } catch (e) {
+      history = [];
+    }
+  }
+
+  const cutoff = Date.now() - FB_CONFIG.HISTORY_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  history = history.filter(entry => entry.postedAt >= cutoff);
+  history.push({ handle: handle, postedAt: Date.now() });
+
+  const trimmed = history.slice(-FB_CONFIG.HISTORY_MAX_ENTRIES);
+  props.setProperty(FB_CONFIG.HISTORY_PROPERTY_KEY, JSON.stringify(trimmed));
 }
 
 /**
@@ -288,7 +361,7 @@ https://business.facebook.com/latest/posts?tab=drafts
 
 /**
  * 下書き作成の失敗をメールで通知する。
- * (アクセストークン失効など、Graph API Explorerで再取得が必要なケースが多い)
+ * (システムユーザーのアセット割り当て解除・アプリ側の問題などで失敗するケースが多い)
  */
 function notifyDraftFailed_(error) {
   const subject = `【ふくしま市場】Facebook下書きの作成に失敗しました(${Utilities.formatDate(new Date(), 'Asia/Tokyo', 'M月d日')})`;
@@ -297,10 +370,17 @@ createFacebookDraftPost の実行中にエラーが発生しました。
 
 ${error}
 
-よくある原因: FB_PAGE_ACCESS_TOKEN の有効期限切れ(60日程度で失効します)。
-その場合は https://developers.facebook.com/tools/explorer/ で
-Graph API Explorer(デフォルトアプリ)からfukushimaichibaページの管理者アカウントで
-再度トークンを取得し、スクリプトプロパティ FB_PAGE_ACCESS_TOKEN を更新してください。
+よくある原因と対処:
+- エラー190(トークン無効・期限切れ) → https://business.facebook.com/settings の
+  システムユーザーで、トークンを再生成する(有効期限は必ず「なし(Never)」)
+- エラー200/10(権限不足) → 同画面でシステムユーザーへの
+  ページ・アプリのアセット割り当てと権限チェックを再確認する
+- 投稿は成功するがページに表示されない → Metaアプリが「開発モード」の
+  可能性がある。developers.facebook.com でアプリを「ライブ」にする
+
+取得し直したトークンは、Apps Scriptのスクリプトプロパティ
+FB_PAGE_ACCESS_TOKEN に設定してください。詳しい手順は
+fb-draft-post-agent.gs 冒頭のコメントを参照。
 `;
   GmailApp.sendEmail(FB_CONFIG.RECIPIENT_EMAIL, subject, body);
 }

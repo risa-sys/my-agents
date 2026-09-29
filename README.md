@@ -10,9 +10,11 @@ Google Apps Script トリガーが担当します)。
 
 - `daily-task-agent.gs` — 前日のメールから「今日やることリスト」を作成し、自分宛に送信
 - `fb-draft-post-agent.gs` — 毎朝、ふくしま市場([fukushima-ichiba.com](https://fukushima-ichiba.com/))の
-  新着・売れ筋商品と当日の話題を絡めたFacebook投稿文をGeminiで生成し、
+  売れ筋ランキング([collections/ranking_top10](https://fukushima-ichiba.com/collections/ranking_top10))を基準に、
+  新着商品も加えた候補と当日の話題を絡めたFacebook投稿文をGeminiで生成し、
   Facebookページ([facebook.com/fukushimaichiba](https://www.facebook.com/fukushimaichiba/))に
   **下書き(未公開投稿)として保存**する。自動公開はせず、Meta Business Suiteで内容確認後に手動公開する。
+  直近30日以内に紹介済みの商品は候補から除外し、同じ商品が続けて登場しないようにしている。
   セットアップ手順はファイル冒頭のコメントを参照。
 
 ## セットアップ(初回のみ・手元の端末で実施)
@@ -54,13 +56,14 @@ Google Apps Script トリガーが担当します)。
 6. `fb-draft-post-agent.gs` を使う場合は、追加でスクリプトプロパティに
    `FB_PAGE_ID` / `FB_PAGE_ACCESS_TOKEN` を設定し、
    関数選択で `setupFacebookDraftTrigger` を実行して毎朝8:30のトリガーを作成する
-   - トークンの取得は、fukushimaichibaページの管理者アカウントで
-     [Graph API Explorer](https://developers.facebook.com/tools/explorer/)(Meta純正のデフォルトアプリ、
-     自分でアプリを作る必要なし)を開き、権限に `pages_show_list` / `pages_manage_posts` /
-     `pages_read_engagement` を追加してトークン取得 → `GET /me/accounts` でページID・
-     ページアクセストークンを確認、という流れ(詳細はファイル冒頭のコメント参照)
-   - このトークンは60日程度で失効するため、失効時は同じ手順で取り直して
-     `FB_PAGE_ACCESS_TOKEN` を更新する(失効時は失敗通知メールが届きます)
+   - トークンの取得は [Meta Business Suite](https://business.facebook.com/settings) の
+     「システムユーザー」機能を使う。ビジネスポートフォリオ(スペースワン)の管理者権限で、
+     システムユーザーに fukushimaichiba ページと投稿用Metaアプリをアセット割り当てし、
+     有効期限「なし(Never)」・権限 `pages_manage_posts` / `pages_read_engagement` /
+     `pages_show_list` でトークンを生成 → `GET /me/accounts` でページIDを確認、という流れ
+     (詳細な手順・トラブルシューティングはファイル冒頭のコメント参照)
+   - この方式のトークンは失効しないため、通常は再取得不要。エラーになった場合は
+     失敗通知メールの案内に沿って同じ画面からトークンを再生成する
 
 7. GitHub Actions 用の Secrets を登録
    ```
