@@ -28,7 +28,8 @@ const CONFIG = {
   // 直近で紹介済みの商品と被らないようにするための履歴(ワークフローがコミットして保存する)
   HISTORY_FILE: 'data/fb-posted-history.json',
   HISTORY_RETENTION_DAYS: 30,
-  HISTORY_MAX_ENTRIES: 60
+  HISTORY_MAX_ENTRIES: 60,
+  TOKEN_WARN_DAYS: 14 // トークンの残り日数がこれを切ったら Issue で知らせる
 };
 
 const MODE = process.env.MODE || 'draft';
@@ -39,6 +40,7 @@ async function main() {
 
   const page = await resolvePage(pageId, token);
   log(`Facebookページ確認OK: ${page.name} (${pageId})`);
+  await warnIfTokenExpiresSoon(token);
   if (MODE === 'check') {
     summary(`### トークン確認OK\n- ページ: ${page.name} (${pageId})`);
     return;
@@ -73,6 +75,30 @@ async function main() {
     '',
     'Meta Business Suite の下書きから確認して、問題なければ手動で公開してください: https://business.facebook.com/latest/posts?tab=drafts'
   ].join('\n'));
+}
+
+/**
+ * トークンの有効期限が近いときに警告を出す。
+ * 残り TOKEN_WARN_DAYS 日を切ったら GITHUB_OUTPUT に書き出し、ワークフロー側で Issue を立てて知らせる。
+ */
+async function warnIfTokenExpiresSoon(token) {
+  let data;
+  try {
+    data = (await graphGet(`debug_token?input_token=${encodeURIComponent(token)}`, token)).data;
+  } catch (e) {
+    log('トークンの有効期限を確認できませんでした: ' + e.message);
+    return;
+  }
+  if (!data || !data.expires_at) return; // 0 = 無期限
+  const daysLeft = Math.floor((data.expires_at * 1000 - Date.now()) / (24 * 60 * 60 * 1000));
+  const expiresText = new Date(data.expires_at * 1000).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
+  log(`トークンの有効期限: ${expiresText}(残り${daysLeft}日)`);
+  if (daysLeft <= CONFIG.TOKEN_WARN_DAYS) {
+    console.log(`::warning::Facebookトークンの有効期限が近づいています: ${expiresText}(残り${daysLeft}日)`);
+    if (process.env.GITHUB_OUTPUT) {
+      appendFileSync(process.env.GITHUB_OUTPUT, `token_expires=${expiresText}\ntoken_days_left=${daysLeft}\n`);
+    }
+  }
 }
 
 /**

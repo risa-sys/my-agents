@@ -13,6 +13,7 @@ on:
 
 permissions:
   contents: write # 紹介済み商品の履歴ファイルをコミットするため
+  issues: write # トークンの期限が近いときに Issue で知らせるため
 
 concurrency:
   group: fb-draft-post
@@ -29,12 +30,27 @@ jobs:
           node-version: "20"
 
       - name: Create Facebook draft
+        id: post
         env:
           MODE: ${{ inputs.mode || 'draft' }}
           FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
           FB_PAGE_ACCESS_TOKEN: ${{ secrets.FB_PAGE_ACCESS_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: node scripts/fb-draft-post.mjs
+
+      - name: Notify token expiry
+        if: ${{ steps.post.outputs.token_days_left != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPIRES: ${{ steps.post.outputs.token_expires }}
+          DAYS_LEFT: ${{ steps.post.outputs.token_days_left }}
+        run: |
+          title="Facebookトークンの有効期限が近づいています"
+          if [ -n "$(gh issue list --state open --search "in:title $title" --json number --jq '.[].number')" ]; then exit 0; fi
+          gh issue create --title "$title" --body "FB_PAGE_ACCESS_TOKEN の有効期限: ${EXPIRES}(残り${DAYS_LEFT}日)
+
+          期限が切れると毎朝の下書き作成が止まります。Meta Business Suite のシステムユーザーでトークンを再生成し、
+          \`gh secret set FB_PAGE_ACCESS_TOKEN\` で差し替えてください。差し替えたらこの Issue を閉じてください。"
 
       - name: Save posted-product history
         if: ${{ (inputs.mode || 'draft') == 'draft' }}
