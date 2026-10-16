@@ -1,0 +1,47 @@
+name: Facebook draft post (fukushima-ichiba)
+
+on:
+  schedule:
+    - cron: "30 23 * * *" # 毎朝 8:30 JST(GitHub側の混雑で数分〜数十分遅れることがある)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "check=トークン確認のみ / dry-run=文面生成のみ / draft=下書き保存"
+        type: choice
+        options: [check, dry-run, draft]
+        default: check
+
+permissions:
+  contents: write # 紹介済み商品の履歴ファイルをコミットするため
+
+concurrency:
+  group: fb-draft-post
+  cancel-in-progress: false
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Create Facebook draft
+        env:
+          MODE: ${{ inputs.mode || 'draft' }}
+          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+          FB_PAGE_ACCESS_TOKEN: ${{ secrets.FB_PAGE_ACCESS_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: node scripts/fb-draft-post.mjs
+
+      - name: Save posted-product history
+        if: ${{ (inputs.mode || 'draft') == 'draft' }}
+        run: |
+          git add data/fb-posted-history.json
+          if git diff --cached --quiet; then exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Update Facebook posted-product history [skip ci]"
+          git push
