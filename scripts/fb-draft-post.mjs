@@ -36,16 +36,17 @@ const MODE = process.env.MODE || 'draft';
 
 async function main() {
   const token = requireEnv('FB_PAGE_ACCESS_TOKEN');
-  if (MODE === 'check' && !process.env.FB_PAGE_ID) {
-    // FB_PAGE_ID が未登録でもトークンだけ確認でき、登録すべきページIDも分かるようにする
+  if (MODE === 'check') {
+    // FB_PAGE_ID が未登録・誤りでも、登録すべきページIDが分かるようにする
     await warnIfTokenExpiresSoon(token);
+    const me = await graphGet('me?fields=name,id', token);
     const pages = (await graphGet('me/accounts?fields=name,id', token)).data || [];
     summary([
-      '### トークン確認OK(FB_PAGE_ID は未登録)',
-      'このトークンで扱えるページ:',
-      ...pages.map(p => `- ${p.name}: ${p.id}`)
+      `### トークンの持ち主: ${me.name}`,
+      `このトークンで扱えるページ(${pages.length}件):`,
+      ...pages.map(p => `- ${p.name}: ${p.id}${p.id === process.env.FB_PAGE_ID ? ' ← FB_PAGE_ID と一致' : ''}`)
     ].join('\n'));
-    return;
+    if (!process.env.FB_PAGE_ID) return;
   }
   const pageId = requireEnv('FB_PAGE_ID');
 
