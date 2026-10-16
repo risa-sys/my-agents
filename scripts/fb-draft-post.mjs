@@ -35,8 +35,19 @@ const CONFIG = {
 const MODE = process.env.MODE || 'draft';
 
 async function main() {
-  const pageId = requireEnv('FB_PAGE_ID');
   const token = requireEnv('FB_PAGE_ACCESS_TOKEN');
+  if (MODE === 'check' && !process.env.FB_PAGE_ID) {
+    // FB_PAGE_ID が未登録でもトークンだけ確認でき、登録すべきページIDも分かるようにする
+    await warnIfTokenExpiresSoon(token);
+    const pages = (await graphGet('me/accounts?fields=name,id', token)).data || [];
+    summary([
+      '### トークン確認OK(FB_PAGE_ID は未登録)',
+      'このトークンで扱えるページ:',
+      ...pages.map(p => `- ${p.name}: ${p.id}`)
+    ].join('\n'));
+    return;
+  }
+  const pageId = requireEnv('FB_PAGE_ID');
 
   const page = await resolvePage(pageId, token);
   log(`Facebookページ確認OK: ${page.name} (${pageId})`);
