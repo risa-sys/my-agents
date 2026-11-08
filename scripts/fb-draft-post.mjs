@@ -33,6 +33,10 @@ const CONFIG = {
   // すべてのモデルが混雑・通信エラーのとき、この時間だけ待って最初のモデルからやり直す(回数=要素数)
   GEMINI_RETRY_WAITS_MS: String(process.env.GEMINI_RETRY_WAITS_MS ?? '30000,60000').split(',').map(Number),
   GEMINI_OUTAGE_SLOTS: 2, // 混雑・通信エラーで生成できない日がこれだけ続いたら、残りの日は待たずに見送る
+  // 同じモデルへの呼び出し間隔。上限は「プロジェクト×モデルごと」に数えられるため、モデル単位であける
+  GEMINI_MIN_INTERVAL_MS: Number(process.env.GEMINI_MIN_INTERVAL_MS ?? 6000),
+  // 429 で示された待ち時間(retryDelay)がこれ以内なら、待って同じモデルでやり直す
+  GEMINI_MAX_RETRY_DELAY_MS: Number(process.env.GEMINI_MAX_RETRY_DELAY_MS ?? 65000),
   GEMINI_MAX_ATTEMPTS: 3, // ルールを外れた本文は、理由を添えて作り直させる
   MAX_PRODUCT_SWITCHES: 2, // それでも直らないときに、予備の商品へ差し替える回数
   GRAPH_API_VERSION: 'v26.0',
@@ -102,8 +106,8 @@ const CONFIG = {
   SIMILARITY_JACCARD: 0.6, // 見出し・最後の一文の「商品名を除いた言い回し」がこれ以上似ていたら類似
   SAME_ENDING_LIMIT: 2, // 文末(最後の4文字)が同じ投稿はこの件数まで
   SAME_STRUCTURE_LIMIT: 3, // 段落・文の組み立てが同じ投稿はこの件数まで
-  SAME_FOCUS_LIMIT: 2, // 切り口が同じ投稿はこの件数まで
-  SAME_HEADLINE_SHAPE_LIMIT: 3, // 見出しの形(絵文字の有無・「」の位置)が同じ投稿はこの件数まで
+  SAME_FOCUS_LIMIT: 3, // 切り口が同じ投稿はこの件数まで(見出し・本文・締めの類似は別に確かめる)
+  SAME_HEADLINE_SHAPE_LIMIT: 3, // 絵文字や「」を使う見出しで、形(絵文字の有無・「」の位置)が同じ投稿はこの件数まで
   MAX_EMOJI_HEADLINES: 4, // 絵文字で始まる見出しはこの件数まで(7件中)
   WEEK_REWRITE_LIMIT: 4, // 類似で書き直す投稿の上限(1回の実行あたり)
   WEEK_REWRITE_ATTEMPTS: 2, // 1投稿あたりの書き直し回数
@@ -210,6 +214,7 @@ async function runWeeklyPreview() {
   const avoid = { openings: [...historyPhrases.openings], closings: [...historyPhrases.closings] };
   const results = new Map();
   let outageStreak = 0;
+  let lastDailyQuota = false;
   for (const date of openDates) {
     const a = assignments.find(x => x.date === date);
     if (!a) {
@@ -219,7 +224,9 @@ async function runWeeklyPreview() {
     if (outageStreak >= CONFIG.GEMINI_OUTAGE_SLOTS) {
       // 混雑・通信エラーが続いているときは、残りの日で長く待ち続けない
       nextVerified.release(a.product);
-      results.set(date, { date, failed: true, transient: true, product: a.product, error: `Gemini の混雑・通信エラーが${outageStreak}日続いたため、この日は生成を見送りました` });
+      results.set(date, { date, failed: true, transient: true, product: a.product, error: lastDailyQuota
+        ? 'Gemini の1日の利用上限に達したため、この日は生成を見送りました(日本時間17時ごろにリセット)'
+        : `Gemini の混雑・通信エラーが${outageStreak}日続いたため、この日は生成を見送りました` });
       continue;
     }
     const anniversary = await resolveAnniversary(date, a, anniversaries[date]);
@@ -229,7 +236,9 @@ async function runWeeklyPreview() {
       avoid.openings.push(post.opening);
       avoid.closings.push(post.closing);
     }
-    outageStreak = post.failed && post.transient ? outageStreak + 1 : 0;
+    // 1日の上限に達したときは、残りの日もすぐ見送る
+    lastDailyQuota = Boolean(post.dailyQuota);
+    outageStreak = post.failed && post.transient ? (post.dailyQuota ? CONFIG.GEMINI_OUTAGE_SLOTS : outageStreak + 1) : 0;
     results.set(date, post);
   }
   // 7件そろってから、見出し・最後の一文・構成・切り口の似すぎを確かめ、似すぎた投稿を書き直す
@@ -257,6 +266,7 @@ async function runWeeklyPreview() {
     ...posts.map(p => `| ${formatDateJa(p.date)} | ${mdCell(slotTitle(p))} | ${mdCell(p.product?.genre || p.entry?.genre || '-')} | ${mdCell(slotAnniversary(p))} | ${slotStatus(p)} |`),
     '',
     `週全体の類似チェック: 似すぎ${weekReview.checked}件 → 書き直し${weekReview.rewritten.length}件 / 残り${weekReview.remaining}件`,
+    geminiUsageSummary(),
     recorded === null
       ? '生成に成功した投稿がないため、候補履歴は変更していません'
       : `候補履歴に記録: ${recorded}件(${CONFIG.HISTORY_FILE})`,
@@ -783,6 +793,7 @@ async function generateForSlotInner(apiKey, slot, nextVerified, avoid, weekPosts
   let best = null;
   let lastError = null;
   let transient = false;
+  let dailyQuota = false;
   for (let s = 0; s <= CONFIG.MAX_PRODUCT_SWITCHES; s++) {
     const product = s === 0 ? slot.product : await nextVerified();
     if (!product) break;
@@ -800,6 +811,7 @@ async function generateForSlotInner(apiKey, slot, nextVerified, avoid, weekPosts
       } catch (e) {
         lastError = e.message;
         transient = Boolean(e.transient);
+        dailyQuota = Boolean(e.dailyQuota);
         errored = true;
         break;
       }
@@ -816,18 +828,19 @@ async function generateForSlotInner(apiKey, slot, nextVerified, avoid, weekPosts
     if (bestStyle) return bestStyle;
     if (errored && !best) {
       // Gemini 自体のエラーは商品を替えても直らないことが多いので、この日は失敗にする
-      return { date: slot.date, failed: true, transient, error: `Gemini APIエラー: ${lastError}`, product, replaced };
+      return { date: slot.date, failed: true, transient, dailyQuota, error: `Gemini APIエラー: ${lastError}`, product, replaced };
     }
     replaced.push({ title: product.title, reason: errored ? 'Gemini APIエラー' : 'ルール・事実確認を満たせなかった' });
   }
   if (best) return { ...best, ok: false, needsReview: true, replaced };
-  return { date: slot.date, failed: true, transient, error: lastError ? `Gemini APIエラー: ${lastError}` : '確認できた候補商品が足りませんでした', replaced };
+  return { date: slot.date, failed: true, transient, dailyQuota, error: lastError ? `Gemini APIエラー: ${lastError}` : '確認できた候補商品が足りませんでした', replaced };
 }
 
 /** 失敗・要確認の理由を、プレビュー向けの短い説明にする */
 function describeProblem(p) {
   if (p.failed) {
     const e = String(p.error || '');
+    if (/1日の(利用)?上限/.test(e)) return { title: 'Gemini の1日の利用上限に達したため生成できませんでした', detail: e };
     if (/見送りました/.test(e)) return { title: 'Gemini の障害が続いたため生成を見送りました', detail: e };
     if (/応答がありませんでした|fetch failed/.test(e) && !/503|UNAVAILABLE/.test(e)) return { title: 'Gemini との通信エラーで生成できませんでした', detail: e };
     if (/混雑|503|UNAVAILABLE|RESOURCE_EXHAUSTED|429/.test(e)) return { title: 'Gemini が混雑していたため生成できませんでした', detail: e };
@@ -945,7 +958,9 @@ function findSimilarities(posts) {
     (k, g) => `構成(${k})が${g.length}件で同じ(${g.map(label).join('、')})`);
   overLimit(p => (p.focus && p.focus !== 'その他' ? p.focus : ''), CONFIG.SAME_FOCUS_LIMIT,
     (k, g) => `切り口「${k}」が${g.length}件で同じ(${g.map(label).join('、')})`);
-  overLimit(p => headlineShape(p.opening), CONFIG.SAME_HEADLINE_SHAPE_LIMIT,
+  // 型になりやすい形(絵文字や「」を使う見出し)だけを数える。絵文字も「」もない素直な見出しは数えない
+  // (言い回しの近さは上の見出しの比較で確かめる。自然な見出しを無理に絵文字・「」付きへ書き直させないため)
+  overLimit(p => { const s = headlineShape(p.opening); return s === '絵文字なし・「」なし' ? '' : s; }, CONFIG.SAME_HEADLINE_SHAPE_LIMIT,
     (k, g) => `見出しの形(${k})が${g.length}件で同じ(${g.map(label).join('、')})`);
   overLimit(p => (startsWithEmoji(p.opening) ? '絵文字' : ''), CONFIG.MAX_EMOJI_HEADLINES,
     (k, g) => `絵文字で始まる見出しが${g.length}件(${CONFIG.MAX_EMOJI_HEADLINES}件まで)`);
@@ -1155,9 +1170,36 @@ function evaluatePost(data, date, product, anniversary, avoid) {
   };
 }
 
+/** Gemini の呼び出し状況(プレビューと実行結果に表示する。APIキーなどの秘密は含めない) */
+const geminiUsage = { calls: 0, byModel: {}, rateLimits: [], dailyExhausted: [] };
+const geminiLastCallAt = new Map();
+
+function countGemini(model, key) {
+  geminiUsage.byModel[model] ??= { calls: 0, ok: 0, rateLimited: 0, unavailable: 0, timeout: 0, networkError: 0, badOutput: 0 };
+  geminiUsage.byModel[model][key]++;
+}
+
+/**
+ * 429 の詳細(どの上限か・待つべき秒数)を取り出す。
+ * Gemini API は QuotaFailure(quotaId 例: GenerateRequestsPerMinutePerProjectPerModel-FreeTier)と
+ * RetryInfo(retryDelay 例: "13s")を返すことがある。
+ */
+function rateLimitInfo(error) {
+  const details = Array.isArray(error?.details) ? error.details : [];
+  const violations = details.find(d => String(d?.['@type'] || '').includes('QuotaFailure'))?.violations || [];
+  const quotas = violations.map(v => ({ id: String(v.quotaId || v.quotaMetric || ''), value: v.quotaValue ?? '' })).filter(q => q.id);
+  const delay = String(details.find(d => String(d?.['@type'] || '').includes('RetryInfo'))?.retryDelay || '');
+  const seconds = /^(\d+(?:\.\d+)?)s$/.test(delay) ? Number(delay.slice(0, -1)) : null;
+  const daily = quotas.some(q => /PerDay|per_day|PerProjectPerDay/i.test(q.id));
+  return { quotas, retryAfterMs: seconds === null ? null : Math.ceil(seconds * 1000), daily };
+}
+
 /**
  * GEMINI_MODELS を先頭から試す。混雑(503など)・上限(429)・通信エラー・時間切れ・出力の崩れのときは次のモデルへ。
- * すべてのモデルで駄目なら GEMINI_RETRY_WAITS_MS だけ待って最初からやり直す。
+ * - 同じモデルへの呼び出しは GEMINI_MIN_INTERVAL_MS 以上あける(1分あたりの上限に当たりにくくする)
+ * - 429 で「1日の上限」と分かったモデルは、この実行では使わない
+ * - 429 で待つべき秒数(retryDelay)が示され、GEMINI_MAX_RETRY_DELAY_MS 以内なら、待って同じモデルで1回だけやり直す
+ * - すべてのモデルで駄目なら GEMINI_RETRY_WAITS_MS だけ待って最初からやり直す(全モデルが1日の上限ならすぐ止める)
  * APIキーの誤りなど一時的でないエラーはすぐに止める。APIキーはヘッダーでのみ送り、ログには出さない。
  * 投げるエラーには transient(一時的な障害か)を付ける。
  */
@@ -1165,55 +1207,93 @@ async function callGeminiJson(apiKey, prompt) {
   const waits = [0, ...CONFIG.GEMINI_RETRY_WAITS_MS];
   let last = '';
   for (let round = 0; round < waits.length; round++) {
+    const usable = CONFIG.GEMINI_MODELS.filter(m => !geminiUsage.dailyExhausted.includes(m));
+    if (usable.length === 0) break;
     if (waits[round] > 0) {
-      log(`Gemini が混雑・通信エラーのため ${Math.round(waits[round] / 1000)} 秒待って再試行します(${round}/${waits.length - 1})`);
+      log(`Gemini が混雑・通信エラー・上限のため ${Math.round(waits[round] / 1000)} 秒待って再試行します(${round}/${waits.length - 1})`);
       await sleep(waits[round]);
     }
-    for (const model of CONFIG.GEMINI_MODELS) {
-      let json;
-      // 応答待ちが長引いたら打ち切る(本文の受信まで含めて GEMINI_TIMEOUT_MS)
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(Object.assign(new Error('timeout'), { name: 'TimeoutError' })), CONFIG.GEMINI_TIMEOUT_MS);
-      try {
-        const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: prompt }] }],
-            generationConfig: { responseMimeType: 'application/json', temperature: 1.0 }
-          }),
-          signal: controller.signal
-        });
-        json = await res.json();
-      } catch (e) {
-        if (controller.signal.aborted) e = controller.signal.reason;
-        last = e?.name === 'TimeoutError'
-          ? `(${model}) ${Math.round(CONFIG.GEMINI_TIMEOUT_MS / 1000)}秒以内に応答がありませんでした`
-          : `(${model}) 通信エラー: ${e?.message || e}`;
-        log(`Gemini ${last} → 次のモデルを試します`);
-        continue;
-      } finally {
-        clearTimeout(timer);
-      }
-      if (json.error) {
-        last = `(${model}) ${json.error.code} ${json.error.status}: ${json.error.message}`;
-        const transient = ['UNAVAILABLE', 'RESOURCE_EXHAUSTED', 'DEADLINE_EXCEEDED', 'INTERNAL'].includes(json.error.status)
-          || [429, 500, 503, 504].includes(json.error.code);
-        if (!transient) throw Object.assign(new Error(last), { transient: false });
-        log(`Gemini ${model} が一時的に使えないため次のモデルを試します: ${json.error.code} ${json.error.status}`);
-        continue;
-      }
-      const rawText = json.candidates?.[0]?.content?.parts?.[0]?.text || '';
-      const cleaned = rawText.trim().replace(/^```(json)?/i, '').replace(/```$/, '').trim();
-      try {
-        return { data: JSON.parse(cleaned), model };
-      } catch {
-        last = `(${model}) 出力をJSONとして解析できませんでした: ${rawText.slice(0, 120)}`;
-        log(`Gemini ${last} → 次のモデルを試します`);
+    for (const model of usable) {
+      for (let sameModelTry = 0; sameModelTry < 2; sameModelTry++) {
+        if (geminiUsage.dailyExhausted.includes(model)) break;
+        const readyAt = (geminiLastCallAt.get(model) || 0) + CONFIG.GEMINI_MIN_INTERVAL_MS;
+        while (Date.now() < readyAt) await sleep(readyAt - Date.now());
+        geminiLastCallAt.set(model, Date.now());
+        geminiUsage.calls++;
+        countGemini(model, 'calls');
+        let json;
+        // 応答待ちが長引いたら打ち切る(本文の受信まで含めて GEMINI_TIMEOUT_MS)
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(Object.assign(new Error('timeout'), { name: 'TimeoutError' })), CONFIG.GEMINI_TIMEOUT_MS);
+        try {
+          const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+            body: JSON.stringify({
+              contents: [{ parts: [{ text: prompt }] }],
+              generationConfig: { responseMimeType: 'application/json', temperature: 1.0 }
+            }),
+            signal: controller.signal
+          });
+          json = await res.json();
+        } catch (e) {
+          if (controller.signal.aborted) e = controller.signal.reason;
+          const timedOut = e?.name === 'TimeoutError';
+          countGemini(model, timedOut ? 'timeout' : 'networkError');
+          last = timedOut
+            ? `(${model}) ${Math.round(CONFIG.GEMINI_TIMEOUT_MS / 1000)}秒以内に応答がありませんでした`
+            : `(${model}) 通信エラー: ${e?.message || e}`;
+          log(`Gemini ${last} → 次のモデルを試します`);
+          break;
+        } finally {
+          clearTimeout(timer);
+        }
+        if (json.error) {
+          last = `(${model}) ${json.error.code} ${json.error.status}: ${json.error.message}`;
+          const transient = ['UNAVAILABLE', 'RESOURCE_EXHAUSTED', 'DEADLINE_EXCEEDED', 'INTERNAL'].includes(json.error.status)
+            || [429, 500, 503, 504].includes(json.error.code);
+          if (!transient) throw Object.assign(new Error(last), { transient: false });
+          if (json.error.code === 429 || json.error.status === 'RESOURCE_EXHAUSTED') {
+            countGemini(model, 'rateLimited');
+            const info = rateLimitInfo(json.error);
+            geminiUsage.rateLimits.push({ model, at: new Date().toISOString(), quotas: info.quotas, retryAfterMs: info.retryAfterMs });
+            const which = info.quotas.length ? info.quotas.map(q => `${q.id}${q.value !== '' ? `=${q.value}` : ''}`).join(', ') : '上限の種類は不明';
+            if (info.daily) {
+              geminiUsage.dailyExhausted.push(model);
+              log(`Gemini ${model} が1日の上限に達しました(${which})。この実行では使いません`);
+              break;
+            }
+            if (sameModelTry === 0 && info.retryAfterMs !== null && info.retryAfterMs <= CONFIG.GEMINI_MAX_RETRY_DELAY_MS) {
+              log(`Gemini ${model} が上限(429: ${which})のため、指示どおり ${Math.ceil(info.retryAfterMs / 1000)} 秒待って同じモデルでやり直します`);
+              await sleep(info.retryAfterMs + 1000);
+              continue;
+            }
+            log(`Gemini ${model} が上限(429: ${which})のため次のモデルを試します`);
+            break;
+          }
+          countGemini(model, 'unavailable');
+          log(`Gemini ${model} が一時的に使えないため次のモデルを試します: ${json.error.code} ${json.error.status}`);
+          break;
+        }
+        const rawText = json.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        const cleaned = rawText.trim().replace(/^```(json)?/i, '').replace(/```$/, '').trim();
+        try {
+          const data = JSON.parse(cleaned);
+          countGemini(model, 'ok');
+          return { data, model };
+        } catch {
+          countGemini(model, 'badOutput');
+          last = `(${model}) 出力をJSONとして解析できませんでした: ${rawText.slice(0, 120)}`;
+          log(`Gemini ${last} → 次のモデルを試します`);
+          break;
+        }
       }
     }
   }
-  throw Object.assign(new Error(`混雑・通信エラーが続いたため生成できませんでした(${waits.length}巡試行。最後: ${last})`), { transient: true });
+  if (CONFIG.GEMINI_MODELS.every(m => geminiUsage.dailyExhausted.includes(m))) {
+    throw Object.assign(new Error(`すべての Gemini モデルが1日の上限に達しました(太平洋時間の0時=日本時間17時ごろにリセット)。最後: ${last}`), { transient: true, dailyQuota: true });
+  }
+  throw Object.assign(new Error(`混雑・通信エラー・上限が続いたため生成できませんでした(${waits.length}巡試行。最後: ${last})`), { transient: true });
 }
 
 /** 本文に紛れ込んだ URL・ハッシュタグ・「▼詳細はこちら」を取り除く(後でコード側が付ける)。 */
@@ -1508,6 +1588,8 @@ ${done.problems.length ? `
     </table>
   </section>
 
+  ${renderGeminiUsage()}
+
   <section class="panel">
     <h2>商品情報の取得</h2>
     <ul class="issues">
@@ -1656,6 +1738,40 @@ document.addEventListener('click', async e => {
   btn._timer = setTimeout(() => { status.textContent = ''; }, 2500);
 });
 `;
+
+/** Gemini の呼び出し回数・上限(429)の内訳。上限の実際の値は AI Studio のレート制限ページで確認できる */
+function renderGeminiUsage() {
+  const rows = Object.entries(geminiUsage.byModel).map(([model, c]) => `
+      <tr><td>${esc(model)}${geminiUsage.dailyExhausted.includes(model) ? ' <span class="ng">(1日の上限)</span>' : ''}</td>
+        <td>${c.calls}</td><td class="ok">${c.ok}</td><td class="${c.rateLimited ? 'ng' : ''}">${c.rateLimited}</td>
+        <td>${c.unavailable}</td><td>${c.timeout}</td><td>${c.networkError + c.badOutput}</td></tr>`).join('');
+  const quotas = new Map();
+  for (const r of geminiUsage.rateLimits) {
+    for (const q of r.quotas.length ? r.quotas : [{ id: '(種類不明)', value: '' }]) {
+      const key = `${r.model} ${q.id}`;
+      const prev = quotas.get(key) || { model: r.model, id: q.id, value: q.value, count: 0, retry: [] };
+      prev.count++;
+      if (r.retryAfterMs !== null) prev.retry.push(Math.ceil(r.retryAfterMs / 1000));
+      quotas.set(key, prev);
+    }
+  }
+  const quotaRows = [...quotas.values()].map(q => `<li>${esc(q.model)}: ${esc(q.id)}${q.value !== '' ? `(上限 ${esc(q.value)})` : ''} × ${q.count}回${q.retry.length ? `<span class="meta">(待ち時間の指示: ${esc([...new Set(q.retry)].join('・'))}秒)</span>` : ''}</li>`).join('');
+  return `<section class="panel">
+    <h2>Gemini の利用状況</h2>
+    <p class="meta">呼び出し ${geminiUsage.calls}回。同じモデルへの呼び出しは ${Math.round(CONFIG.GEMINI_MIN_INTERVAL_MS / 1000)}秒以上あけています。
+      上限の実際の値は <a href="https://aistudio.google.com/rate-limit" target="_blank" rel="noopener">AI Studio のレート制限ページ</a> で確認できます(1日の上限は日本時間17時ごろにリセット)。</p>
+    <table>
+      <tr><th>モデル</th><th>呼び出し</th><th>成功</th><th>上限(429)</th><th>混雑(503など)</th><th>時間切れ</th><th>通信エラー等</th></tr>${rows || '<tr><td colspan="7">呼び出しなし</td></tr>'}
+    </table>
+    ${quotaRows ? `<h3>上限(429)の内訳</h3><ul class="issues">${quotaRows}</ul>` : ''}
+  </section>`;
+}
+
+function geminiUsageSummary() {
+  const per = Object.entries(geminiUsage.byModel).map(([m, c]) => `${m}: ${c.calls}回(成功${c.ok}・429が${c.rateLimited}・混雑${c.unavailable}・時間切れ${c.timeout})`).join(' / ');
+  const ids = [...new Set(geminiUsage.rateLimits.flatMap(r => r.quotas.map(q => `${r.model} ${q.id}${q.value !== '' ? `=${q.value}` : ''}`)))];
+  return `Gemini: 呼び出し${geminiUsage.calls}回 — ${per || 'なし'}${ids.length ? ` / 429の内訳: ${ids.join(', ')}` : ''}${geminiUsage.dailyExhausted.length ? ` / 1日の上限: ${geminiUsage.dailyExhausted.join(', ')}` : ''}`;
+}
 
 function renderReplaced(replaced) {
   if (!replaced || replaced.length === 0) return '';
