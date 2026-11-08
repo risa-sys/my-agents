@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "preview=文面とプレビュー生成のみ(Facebook通信なし) / check=トークン確認のみ(読み取り) / draft=下書き保存(承認が必要)"
+        description: "preview=文面とプレビュー生成のみ(Facebook通信なし) / models=Geminiの利用可能モデル確認(Facebook通信なし) / check=トークン確認のみ(読み取り) / draft=下書き保存(承認が必要)"
         type: choice
-        options: [preview, check, draft]
+        options: [preview, models, check, draft]
         default: preview
       confirm_page_id:
         description: "draft のときだけ: 承認としてページID 277404605612561 を入力(一致しないと何も送信しない)"
@@ -21,7 +21,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # preview / check: Facebookへの書き込みは行わない
+  # preview / models / check: Facebookへの書き込みは行わない
   preview-or-check:
     if: ${{ inputs.mode != 'draft' }}
     runs-on: ubuntu-latest
@@ -42,7 +42,7 @@ jobs:
           # preview には Facebook のトークンを渡さない
           FB_PAGE_ID: ${{ inputs.mode == 'check' && secrets.FB_PAGE_ID || '' }}
           FB_PAGE_ACCESS_TOKEN: ${{ inputs.mode == 'check' && secrets.FB_PAGE_ACCESS_TOKEN || '' }}
-          GEMINI_API_KEY: ${{ inputs.mode == 'preview' && secrets.GEMINI_API_KEY || '' }}
+          GEMINI_API_KEY: ${{ (inputs.mode == 'preview' || inputs.mode == 'models') && secrets.GEMINI_API_KEY || '' }}
         run: node scripts/fb-draft-post.mjs
 
       - name: Upload preview

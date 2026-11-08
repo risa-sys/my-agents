@@ -12,6 +12,8 @@
  *   draft   … 投稿文を生成し、Facebookページに下書きとして保存する。
  *             FB_DRAFT_APPROVAL にページIDを明示的に入れたときだけ動く。
  *             必要: FB_PAGE_ID, FB_PAGE_ACCESS_TOKEN, GEMINI_API_KEY, FB_DRAFT_APPROVAL
+ *   models  … Gemini APIで使えるFlash系モデルを一覧し、実際に呼び出せるか確かめる。
+ *             Facebookへは一切通信しない。必要: GEMINI_API_KEY
  *
  * 安全装置:
  *   - Facebook への通信はすべて guardedFacebookFetch を通す。preview では全遮断、check では GET のみ、
@@ -55,7 +57,7 @@ const CONFIG = {
   RECENT_OPENINGS_COUNT: 10 // 言い回しが続かないよう、直近の書き出しを避けさせる
 };
 
-const MODES = ['preview', 'check', 'draft'];
+const MODES = ['preview', 'check', 'draft', 'models'];
 const MODE = process.env.MODE || 'preview';
 
 async function main() {
@@ -64,6 +66,10 @@ async function main() {
   }
   if (MODE === 'preview') {
     await runPreview();
+    return;
+  }
+  if (MODE === 'models') {
+    await checkGeminiModels();
     return;
   }
   if (MODE === 'draft') assertDraftApproved();
@@ -277,8 +283,8 @@ function assertDraftApproved() {
  */
 async function guardedFacebookFetch(url, init = {}) {
   const method = (init.method || 'GET').toUpperCase();
-  if (MODE === 'preview') {
-    throw new Error('preview モードではFacebookへの通信は禁止されています。');
+  if (MODE === 'preview' || MODE === 'models') {
+    throw new Error(`${MODE} モードではFacebookへの通信は禁止されています。`);
   }
   if (method === 'GET') return fetch(url, init);
 
@@ -482,6 +488,52 @@ ${productListText}
     feedback = `\n\n前回の本文は次の点がルール違反でした。直して書き直してください: ${draft.warnings.join(' / ')}\n前回の本文:\n${draft.body}\n`;
   }
   return draft;
+}
+
+/**
+ * Gemini APIのモデル一覧からFlash系を抜き出し、それぞれ短い generateContent を1回呼んで
+ * 実際に使えるかを確かめる(一覧に載っていても新規キーでは使えないモデルがあるため)。
+ * APIキーはヘッダーでのみ送り、ログには出さない。
+ */
+async function checkGeminiModels() {
+  const apiKey = requireEnv('GEMINI_API_KEY');
+  const base = 'https://generativelanguage.googleapis.com/v1beta';
+  const headers = { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey };
+
+  const models = [];
+  let pageToken = '';
+  do {
+    const res = await fetch(`${base}/models?pageSize=1000${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}`, { headers });
+    const json = await res.json();
+    if (json.error) throw new Error(`Gemini モデル一覧の取得に失敗しました: ${json.error.code} ${json.error.status} ${json.error.message}`);
+    models.push(...(json.models || []));
+    pageToken = json.nextPageToken || '';
+  } while (pageToken);
+
+  const flash = models.filter(m => /flash/i.test(m.name) && (m.supportedGenerationMethods || []).includes('generateContent'));
+  const targets = [...new Set([...flash.map(m => m.name.replace(/^models\//, '')), 'gemini-3.8-flash', CONFIG.GEMINI_MODEL])];
+
+  const rows = [];
+  for (const name of targets) {
+    const listed = flash.some(m => m.name === `models/${name}`);
+    const res = await fetch(`${base}/models/${name}:generateContent`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ contents: [{ parts: [{ text: 'OKとだけ答えてください。' }] }] })
+    });
+    const json = await res.json();
+    const result = json.error ? `× ${json.error.code} ${json.error.status}: ${String(json.error.message).slice(0, 120)}` : '○ 呼び出し成功';
+    rows.push(`| ${name} | ${listed ? 'あり' : 'なし'} | ${result} |`);
+  }
+
+  summary([
+    `### Gemini モデル確認(全${models.length}件中、generateContent 対応の Flash 系 ${flash.length}件)`,
+    `現在のコードの既定: ${CONFIG.GEMINI_MODEL}`,
+    '',
+    '| モデル | 一覧に掲載 | 実際の呼び出し |',
+    '|---|---|---|',
+    ...rows
+  ].join('\n'));
 }
 
 async function callGemini(apiKey, prompt) {
