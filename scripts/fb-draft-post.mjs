@@ -1,25 +1,24 @@
 /**
- * 「ふくしま市場」Facebookページに下書き投稿を自動作成するエージェント(GitHub Actions版)
+ * 「ふくしま市場」Facebookページの投稿案を、翌週7日分まとめて作るエージェント
  *
- * ふくしま市場の売れ筋ランキング(ranking_top10)を基準に、新着(new-1)も加えた候補から
- * 1商品を選び、Geminiで投稿文を作って Facebookページに「下書き」として保存する。
- * 公開はしない。Meta Business Suite の下書き一覧で内容を確認し、手動で公開する。
+ * 新商品(new-1)・人気ランキング(ranking_top10)を優先し、全商品からも候補を集めて7商品を選ぶ。
+ * 各投稿日の記念日(雑学ネタ帳)と照らし合わせ、Gemini で投稿文を作る。
+ * 結果は HTML プレビューと候補履歴に書き出すだけで、Facebook へは送信しない。
  *
  * MODE(環境変数):
- *   preview … 投稿文を生成し、ローカルのHTMLプレビューを書き出すだけ(既定)。
- *             Facebookへは一切通信しない(GET も含めて遮断する)。必要: GEMINI_API_KEY
- *   check   … トークンとページの疎通だけ確認する(読み取りのみ)。必要: FB_PAGE_ACCESS_TOKEN
- *   draft   … 投稿文を生成し、Facebookページに下書きとして保存する。
- *             FB_DRAFT_APPROVAL にページIDを明示的に入れたときだけ動く。
- *             必要: FB_PAGE_ID, FB_PAGE_ACCESS_TOKEN, GEMINI_API_KEY, FB_DRAFT_APPROVAL
+ *   preview … 7日分の投稿案を作り、HTMLプレビュー(preview/fb-week-<開始日>.html)と
+ *             候補履歴(data/fb-post-history.json)を書き出す(既定)。Facebookへは一切通信しない。
+ *             必要: GEMINI_API_KEY / 任意: WEEK_START(YYYY-MM-DD。省略時は翌週の月曜日)
  *   models  … Gemini APIで使えるFlash系モデルを一覧し、実際に呼び出せるか確かめる。
  *             Facebookへは一切通信しない。必要: GEMINI_API_KEY
+ *   check   … トークンとページの疎通だけ確認する(読み取りのみ)。必要: FB_PAGE_ACCESS_TOKEN
+ *   draft   … 停止中。週次版の下書き保存が完成するまで使わない。
  *
  * 安全装置:
- *   - Facebook への通信はすべて guardedFacebookFetch を通す。preview では全遮断、check では GET のみ、
- *     書き込みは draft かつ承認済みのときだけ、許可したページの /feed への POST に限る。
- *   - 下書きの送信パラメータは許可リスト方式で、published=false と
- *     unpublished_content_type=DRAFT 以外の値では送信しない(公開・予約投稿は送れない)。
+ *   - Facebook への通信はすべて guardedFacebookFetch を通す。check の GET 以外はすべて遮断する
+ *     (書き込みの経路は持たない)。
+ *   - 商品サイト・雑学ネタ帳へのアクセスは politeFetch を通し、間隔を空け、429/503 のときは待って再試行する。
+ *   - 投稿文の事実(産地・製法・数量など)は、Gemini に商品情報からの引用を添えさせ、コードで照合する。
  */
 import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
@@ -29,474 +28,1474 @@ const CONFIG = {
   // 先頭から順に使う。2つ目以降は先頭が混雑・上限で使えないときの予備
   // (2026-11-08 に models モードで、一覧掲載と新APIキーでの呼び出しを確認したモデル)
   GEMINI_MODELS: process.env.GEMINI_MODEL ? [process.env.GEMINI_MODEL] : ['gemini-3.8-flash', 'gemini-3.7-flash'],
+  GEMINI_MAX_ATTEMPTS: 3, // ルールを外れた本文は、理由を添えて作り直させる
+  MAX_PRODUCT_SWITCHES: 2, // それでも直らないときに、予備の商品へ差し替える回数
   GRAPH_API_VERSION: 'v26.0',
-  // draft で書き込みを許可する唯一のページ(ふくしま市場)
-  APPROVED_PAGE_ID: '277404605612561',
-  PREVIEW_FILE: 'preview/fb-preview.html',
+
+  // 商品情報(Shopify の公開データ)
   SHOP_BASE_URL: 'https://fukushima-ichiba.com',
-  PRODUCT_SOURCE_PATHS: [
-    '/collections/ranking_top10/products.json?limit=20', // 基準: 売れ筋ランキング
-    '/collections/new-1/products.json?limit=20'           // 補助: 新着
-  ],
-  PRODUCT_FALLBACK_PATH: '/products.json?limit=20',
-  MAX_CANDIDATE_PRODUCTS: 30,
-  // 直近で紹介済みの商品と被らないようにするための履歴(ワークフローがコミットして保存する)
-  HISTORY_FILE: 'data/fb-posted-history.json',
-  HISTORY_RETENTION_DAYS: 30,
-  HISTORY_MAX_ENTRIES: 60,
-  TOKEN_WARN_DAYS: 14, // トークンの残り日数がこれを切ったら Issue で知らせる
-  // 投稿文のルール(公式Xアカウント https://x.com/fukushima_18 の雰囲気に合わせる)
-  BODY_MIN_CHARS: 100, // 本文の文字数(改行・URL・ハッシュタグを除く)
-  BODY_MAX_CHARS: 180,
-  MAX_EMOJI: 2,
-  // 誇張・不自然な宣伝文句。含まれていたら作り直させる
-  NG_PHRASES: ['最高', '絶品', '今だけ', 'お見逃しなく', '見逃し厳禁', '必見', '激安', '間違いなし', 'ヤバい', 'やばい', '!!', '！！'],
-  HASHTAGS: '#ふくしま市場 #福島県',
+  RANKING_PATH: '/collections/ranking_top10/products.json?limit=250', // 人気ランキング(優先)
+  NEW_PATH: '/collections/new-1/products.json?limit=250', // 新商品(優先)
+  ALL_PATH: '/products.json?limit=250', // 全商品(&page=N で続きを取る)
+  ALL_PAGE_SIZE: 250,
+  ALL_MAX_PAGES: 4,
+  MIN_DESCRIPTION_CHARS: 50, // 説明文がこれより短い商品は、根拠が足りないので候補にしない
   MAX_IMAGES: 2,
-  GEMINI_MAX_ATTEMPTS: 3, // ルールを外れた本文が返ってきたら、理由を添えて作り直させる
+
+  // 今日は何の日(雑学ネタ帳)
+  ZATSUNETA_BASE_URL: 'https://zatsuneta.com',
+  MAX_ANNIVERSARIES_PER_DAY: 40,
+
+  // 外部サイトへのアクセス
+  USER_AGENT: 'fukushima-ichiba-fb-preview/1.0 (+https://fukushima-ichiba.com/)',
+  REQUEST_INTERVAL_MS: Number(process.env.REQUEST_INTERVAL_MS ?? 2000), // 同じサイトへの最短間隔
+  RETRY_WAIT_MS: Number(process.env.RETRY_WAIT_MS ?? 10000), // 429/503 のときの待ち時間(回数に比例して延ばす)
+  MAX_FETCH_RETRIES: 3,
+
+  // 商品ページ・画像の確認(読み取りのみ)
+  IMAGE_HOSTS: ['cdn.shopify.com'], // 商品画像はShopifyの画像配信サーバーのものだけ使う
+  MOCK_IMAGE_HOSTS: ['images.mock.invalid'], // テスト用モックの画像(実在しないドメイン)
+  MAX_VERIFY_FAILURES: 8, // 確認できない商品がこれだけ続いたら、それ以上は探さない(過度なアクセスを避ける)
+
+  // 実データ(live)かテスト用モック(mock)か。mock はテスト用モックを読み込んだときだけ使える
+  DATA_SOURCE: process.env.PREVIEW_DATA_SOURCE || 'live',
+
+  // 週次の生成と履歴
+  DAYS_PER_BATCH: 7,
+  HISTORY_FILE: process.env.HISTORY_FILE || 'data/fb-post-history.json', // テストでは *.test.json しか使えない
+  // candidate=プレビューで選んだ候補 / approved=投稿すると承認した / published=公開済み
+  HISTORY_STATUSES: ['candidate', 'approved', 'published'],
+  REUSE_BLOCK_DAYS: 30, // 投稿予定日の前後この日数に選ばれた商品は選ばない
+  RECENT_PHRASES_COUNT: 14, // 書き出し・締めくくりが続かないよう、直近の分を避けさせる
+  PREVIEW_DIR: 'preview',
+
+  // 投稿文のルール
+  BODY_MIN_CHARS: 100, // 本文の文字数の目安(改行・空白・URL・ハッシュタグを除く)。下回っても作り直さない
+  BODY_MAX_CHARS: 180, // 上回ったら作り直させる
+  MAX_EMOJI: 2,
+  NG_PHRASES: ['最高', '絶品', '今だけ', 'お見逃しなく', '見逃し厳禁', '必見', '激安', '間違いなし', 'ヤバい', 'やばい', '!!', '！！'],
+  // 汎用的な締めの定型表現。本文に含まれていたら作り直させる
+  STOCK_PHRASES: ['お楽しみください', 'おすすめです', 'おすすめします', 'いかがでしょうか', 'いかがですか', 'ご賞味ください',
+    'お試しください', '味わってみてください', '取り入れてみませんか', 'チェックしてみてください', 'ご覧ください', 'お届けします'],
+  // 投稿の切り口(Gemini にどれか1つを選ばせ、同じ週で偏らないようにする)
+  FOCUS_TYPES: ['味', '食感', '香り', '食べ方・使い方', '製法', '産地・育ち', '生産者', '季節', 'その他'],
+  // 週全体の類似チェック
+  SIMILARITY_JACCARD: 0.6, // 見出し・最後の一文の「商品名を除いた言い回し」がこれ以上似ていたら類似
+  SAME_ENDING_LIMIT: 2, // 文末(最後の4文字)が同じ投稿はこの件数まで
+  SAME_STRUCTURE_LIMIT: 3, // 段落・文の組み立てが同じ投稿はこの件数まで
+  SAME_FOCUS_LIMIT: 2, // 切り口が同じ投稿はこの件数まで
+  WEEK_REWRITE_LIMIT: 4, // 類似で書き直す投稿の上限(1回の実行あたり)
+  WEEK_REWRITE_ATTEMPTS: 2, // 1投稿あたりの書き直し回数
+  FIXED_HASHTAGS: ['#ふくしま市場', '#福島県'],
+  EXTRA_HASHTAGS: 2, // 商品情報から選ぶハッシュタグの数(固定と合わせて4個)
   // 参考にしたい公式Xの投稿文を置くと、文体の手本としてプロンプトに入る(投稿ごとに "---" 行で区切る)
   STYLE_EXAMPLES_FILE: 'data/fb-style-examples.txt',
-  RECENT_OPENINGS_COUNT: 10 // 言い回しが続かないよう、直近の書き出しを避けさせる
+
+  TOKEN_WARN_DAYS: 14 // トークンの残り日数がこれを切ったら Issue で知らせる(check)
 };
 
-const MODES = ['preview', 'check', 'draft', 'models'];
+// 雰囲気の参考(2026-11 に共有された「会津みしらず柿」の修正版)。構成や締め方の型としては使わない
+const STYLE_REFERENCE = `🍂 会津の秋の味覚「会津みしらず柿」
+
+会津盆地特有の気候で育まれた、甘み豊かなみしらず柿。
+
+収穫後、約2週間かけてじっくり渋抜きをすることで、とろりとした食感と濃密な甘みに仕上がります。
+
+季節限定の味わいをぜひお楽しみください♪`;
+
+const MODES = ['preview', 'models', 'check', 'draft'];
 const MODE = process.env.MODE || 'preview';
+const IS_MOCK = CONFIG.DATA_SOURCE === 'mock';
+const IMAGE_HOSTS = IS_MOCK ? CONFIG.MOCK_IMAGE_HOSTS : CONFIG.IMAGE_HOSTS;
+const MOCK_LABEL = 'テスト用データ・投稿不可';
+
+const SOURCE_LABELS = { ranking: '人気ランキング', new: '新商品', all: '全商品' };
+const AVAILABILITY_LABELS = { in_stock: '在庫あり', sold_out: '売り切れ', unknown: '在庫未確認' };
+const STATUS_LABELS = { candidate: '候補', approved: '承認済み', published: '公開済み' };
 
 async function main() {
   if (!MODES.includes(MODE)) {
     throw new Error(`MODE は ${MODES.join(' / ')} のいずれかを指定してください(指定値: ${MODE})。`);
   }
-  if (MODE === 'preview') {
-    await runPreview();
-    return;
+  if (MODE === 'draft') {
+    throw new Error('draft モードは週次版が完成するまで停止しています。Facebookへは何も送信していません。');
   }
-  if (MODE === 'models') {
-    await checkGeminiModels();
-    return;
-  }
-  if (MODE === 'draft') assertDraftApproved();
-
-  const token = requireEnv('FB_PAGE_ACCESS_TOKEN');
-  if (MODE === 'check') {
-    // FB_PAGE_ID が未登録・誤りでも、登録すべきページIDが分かるようにする
-    await warnIfTokenExpiresSoon(token);
-    const me = await graphGet('me?fields=name,id', token);
-    const pages = (await graphGet('me/accounts?fields=name,id', token)).data || [];
-    summary([
-      `### トークンの持ち主: ${me.name}`,
-      `このトークンで扱えるページ(${pages.length}件):`,
-      ...pages.map(p => `- ${p.name}: ${p.id}${p.id === process.env.FB_PAGE_ID ? ' ← FB_PAGE_ID と一致' : ''}`)
-    ].join('\n'));
-    if (!process.env.FB_PAGE_ID) return;
-  }
-  const pageId = requireEnv('FB_PAGE_ID');
-
-  const page = await resolvePage(pageId, token);
-  log(`Facebookページ確認OK: ${page.name} (${pageId})`);
-  await warnIfTokenExpiresSoon(token);
-  if (MODE === 'check') {
-    summary(`### トークン確認OK\n- ページ: ${page.name} (${pageId})`);
-    return;
-  }
-
-  const products = await collectProductsOrThrow();
-  const { draft, product, productUrl } = await composePost(products);
-  const postId = await createDraftPost(pageId, page.accessToken, draft.message, productUrl);
-  recordProductAsPosted(product.handle, draft.opening);
-  log(`Facebook下書き作成完了: ${postId}`);
-
-  summary([
-    '### Facebook下書きを作成しました',
-    `- 記念日: ${describeAnniversary(draft)}`,
-    `- 商品: ${product.title}(${product.price}円)`,
-    `- 商品ページ: ${productUrl}`,
-    `- 投稿ID: ${postId}`,
-    '',
-    '```',
-    draft.message,
-    '```',
-    '',
-    'Meta Business Suite の下書きから確認して、問題なければ手動で公開してください: https://business.facebook.com/latest/posts?tab=drafts'
-  ].join('\n'));
+  if (MODE === 'preview') return runWeeklyPreview();
+  if (MODE === 'models') return checkGeminiModels();
+  return runCheck();
 }
 
+// ---------------------------------------------------------------------------
+// 週次プレビュー
+// ---------------------------------------------------------------------------
+
 /**
- * Facebookに一切通信せず、投稿文を生成してローカルのHTMLプレビューに書き出す。
- * 紹介済み履歴も更新しない。
+ * 実データとテスト用モックを取り違えないための確認。
+ * - テスト用モック(globalThis.__FB_PREVIEW_MOCK__ を立てる)が読み込まれていれば、PREVIEW_DATA_SOURCE=mock が必須
+ * - PREVIEW_DATA_SOURCE=mock はモックが読み込まれているときだけ使える(実データにテスト表示を付けない)
+ * - テストの履歴は *.test.json だけ、実データの履歴は *.test.json 以外だけ
  */
-async function runPreview() {
-  const products = await collectProductsOrThrow();
-  const { draft, product, productUrl } = await composePost(products);
-  const file = resolve(CONFIG.PREVIEW_FILE);
+function assertDataSource() {
+  const mockLoaded = globalThis.__FB_PREVIEW_MOCK__ === true;
+  if (!['live', 'mock'].includes(CONFIG.DATA_SOURCE)) {
+    throw new Error(`PREVIEW_DATA_SOURCE は live または mock を指定してください(指定値: ${CONFIG.DATA_SOURCE})。`);
+  }
+  if (mockLoaded && !IS_MOCK) {
+    throw new Error('テスト用モックが読み込まれているため中止しました。実データ用のプレビュー・履歴は作りません(テストでは PREVIEW_DATA_SOURCE=mock を指定)。');
+  }
+  if (IS_MOCK && !mockLoaded) {
+    throw new Error('PREVIEW_DATA_SOURCE=mock はテスト用モックと一緒にだけ使えます。中止しました。');
+  }
+  if (IS_MOCK && process.env.GITHUB_ACTIONS === 'true') {
+    throw new Error('GitHub Actions ではテスト用モックを使えません。中止しました。');
+  }
+  const testHistory = CONFIG.HISTORY_FILE.endsWith('.test.json');
+  if (IS_MOCK && !testHistory) {
+    throw new Error(`テストでは本番用の履歴(${CONFIG.HISTORY_FILE})を使えません。HISTORY_FILE に *.test.json を指定してください。`);
+  }
+  if (!IS_MOCK && testHistory) {
+    throw new Error(`実データの実行ではテスト用の履歴(${CONFIG.HISTORY_FILE})を使えません。`);
+  }
+}
+
+async function runWeeklyPreview() {
+  assertDataSource();
+  const apiKey = requireEnv('GEMINI_API_KEY');
+  const weekStart = resolveWeekStart();
+  const dates = Array.from({ length: CONFIG.DAYS_PER_BATCH }, (_, i) => addDays(weekStart, i));
+  log(`対象の週: ${dates[0]} 〜 ${dates.at(-1)}`);
+
+  const history = loadHistory();
+  // 承認済み・公開済みの日は作り直さない
+  const lockedByDate = new Map(history.entries
+    .filter(e => e.status !== 'candidate' && dates.includes(e.postDate))
+    .map(e => [e.postDate, e]));
+  const openDates = dates.filter(d => !lockedByDate.has(d));
+
+  const { pool, stats } = await collectProducts(blockedProductIds(history, weekStart, dates));
+  const anniversaries = await fetchAnniversaries(dates);
+
+  // 商品ページ・商品データ・画像を確認できた商品だけを使う(予備も使う直前に確認する)
+  const nextVerified = createVerifiedProductSource(pool, stats);
+  const primary = [];
+  while (primary.length < openDates.length) {
+    const p = await nextVerified();
+    if (!p) break;
+    primary.push(p);
+  }
+  const { assignments, note: assignmentNote } = await assignProducts(apiKey, openDates, primary, anniversaries);
+
+  const historyPhrases = recentPhrases(history, weekStart, dates);
+  const avoid = { openings: [...historyPhrases.openings], closings: [...historyPhrases.closings] };
+  const results = new Map();
+  for (const date of openDates) {
+    const a = assignments.find(x => x.date === date);
+    if (!a) {
+      results.set(date, { date, failed: true, error: '条件に合う候補商品が足りませんでした' });
+      continue;
+    }
+    const anniversary = await resolveAnniversary(date, a, anniversaries[date]);
+    const weekPosts = [...results.values()].filter(p => !p.failed);
+    const post = await generateForSlot(apiKey, { date, product: a.product, anniversary, assignReason: a.reason }, nextVerified, avoid, weekPosts);
+    if (!post.failed) {
+      avoid.openings.push(post.opening);
+      avoid.closings.push(post.closing);
+    }
+    results.set(date, post);
+  }
+  // 7件そろってから、見出し・最後の一文・構成・切り口の似すぎを確かめ、似すぎた投稿を書き直す
+  const weekReview = await reviewWeek(apiKey, openDates.map(d => results.get(d)), historyPhrases, results);
+  for (const [date, entry] of lockedByDate) results.set(date, { date, locked: true, entry });
+
+  const posts = dates.map(d => results.get(d));
+  const recorded = updateHistory(history, weekStart, dates, posts);
+  if (recorded !== null) saveHistory(history);
+
+  const file = resolve(CONFIG.PREVIEW_DIR, `fb-week-${weekStart}${IS_MOCK ? '-TEST' : ''}.html`);
   mkdirSync(dirname(file), { recursive: true });
-  writeFileSync(file, renderPreviewHtml({ draft, product, productUrl, candidateCount: products.length }));
+  writeFileSync(file, renderWeeklyHtml({ weekStart, dates, posts, stats, anniversaries, assignmentNote, recorded, weekReview }));
 
   summary([
-    '### 投稿文プレビュー(Facebookには送信していません)',
-    `- 記念日: ${describeAnniversary(draft)}`,
-    `- 商品: ${product.title}(${product.price}円)`,
-    `- 商品ページ: ${productUrl}`,
-    `- 画像: ${product.images.join(' , ') || '(なし)'}`,
-    `- 本文: ${draft.bodyChars}文字 / 絵文字${draft.emojiCount}個(Geminiモデル: ${draft.model})`,
-    ...draft.warnings.map(w => `- ⚠ ${w}`),
+    ...(IS_MOCK ? [`## ⚠ ${MOCK_LABEL}(テスト用モックで作成)`, ''] : []),
+    `### 週次投稿案プレビュー ${formatDateJa(dates[0])} 〜 ${formatDateJa(dates.at(-1))}(Facebookには送信していません)`,
     '',
-    '```',
-    draft.message,
-    '```',
+    '| 投稿日 | 商品 | 記念日 | 状態 |',
+    '|---|---|---|---|',
+    ...posts.map(p => `| ${formatDateJa(p.date)} | ${mdCell(slotTitle(p))} | ${mdCell(slotAnniversary(p))} | ${slotStatus(p)} |`),
     '',
+    `週全体の類似チェック: 似すぎ${weekReview.checked}件 → 書き直し${weekReview.rewritten.length}件 / 残り${weekReview.remaining}件`,
+    recorded === null
+      ? '生成に成功した投稿がないため、候補履歴は変更していません'
+      : `候補履歴に記録: ${recorded}件(${CONFIG.HISTORY_FILE})`,
     `プレビュー: ${pathToFileURL(file).href}`
   ].join('\n'));
 }
 
-async function collectProductsOrThrow() {
-  const products = await collectCandidateProducts();
-  if (products.length === 0) {
-    throw new Error('ふくしま市場の商品情報を取得できませんでした。サイト構成が変わっていないか確認してください。');
+function resolveWeekStart() {
+  const value = process.env.WEEK_START;
+  if (!value) return nextMondayJst();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value) || Number.isNaN(Date.parse(`${value}T00:00:00Z`))) {
+    throw new Error(`WEEK_START は YYYY-MM-DD 形式で指定してください(指定値: ${value})。`);
   }
-  return products;
+  return value;
+}
+
+// ---------------------------------------------------------------------------
+// 商品情報
+// ---------------------------------------------------------------------------
+
+/**
+ * 人気ランキングと新商品を交互に優先し、その後に全商品(公開日の新しい順)を並べる。
+ * 売り切れ・画像なし・説明文不足・最近選んだ商品は候補から外し、理由を記録する。
+ */
+async function collectProducts(blockedIds) {
+  const ranking = await fetchProductList(CONFIG.RANKING_PATH);
+  const fresh = await fetchProductList(CONFIG.NEW_PATH);
+  const all = { products: [], error: null };
+  for (let page = 1; page <= CONFIG.ALL_MAX_PAGES; page++) {
+    const r = await fetchProductList(`${CONFIG.ALL_PATH}&page=${page}`);
+    if (r.error) {
+      all.error = r.error;
+      break;
+    }
+    all.products.push(...r.products);
+    if (r.products.length < CONFIG.ALL_PAGE_SIZE) break;
+  }
+
+  const byId = new Map();
+  const add = (p, source, rank = null) => {
+    const existing = byId.get(p.id);
+    if (existing) {
+      if (!existing.sources.includes(source)) existing.sources.push(source);
+      if (rank && !existing.rank) existing.rank = rank;
+      return;
+    }
+    byId.set(p.id, { ...p, sources: [source], rank });
+  };
+  ranking.products.forEach((p, i) => add(p, 'ranking', i + 1));
+  fresh.products.forEach(p => add(p, 'new'));
+  all.products.forEach(p => add(p, 'all'));
+
+  const prioritized = [];
+  for (let i = 0; i < Math.max(ranking.products.length, fresh.products.length); i++) {
+    if (ranking.products[i]) prioritized.push(byId.get(ranking.products[i].id));
+    if (fresh.products[i]) prioritized.push(byId.get(fresh.products[i].id));
+  }
+  const rest = all.products.map(p => byId.get(p.id))
+    .sort((a, b) => String(b.publishedAt || '').localeCompare(String(a.publishedAt || '')));
+
+  const excluded = { soldOut: [], noImage: [], shortDescription: [], recentlyUsed: [] };
+  const seen = new Set();
+  const pool = [];
+  for (const p of [...prioritized, ...rest]) {
+    if (seen.has(p.id)) continue;
+    seen.add(p.id);
+    const reason = exclusionReason(p, blockedIds);
+    if (reason) excluded[reason].push(p.title);
+    else pool.push(p);
+  }
+  log(`候補商品: ${pool.length}件(ランキング${ranking.products.length} / 新商品${fresh.products.length} / 全商品${all.products.length})`);
+  return {
+    pool,
+    stats: {
+      counts: { ranking: ranking.products.length, new: fresh.products.length, all: all.products.length },
+      errors: { ranking: ranking.error, new: fresh.error, all: all.error },
+      excluded,
+      eligible: pool.length
+    }
+  };
+}
+
+function exclusionReason(p, blockedIds) {
+  if (p.availability === 'sold_out') return 'soldOut';
+  if (p.images.length === 0) return 'noImage';
+  if (compact(p.description).length < CONFIG.MIN_DESCRIPTION_CHARS) return 'shortDescription';
+  if (blockedIds.has(p.id)) return 'recentlyUsed';
+  return null;
+}
+
+async function fetchProductList(path) {
+  try {
+    const res = await politeFetch(CONFIG.SHOP_BASE_URL + path);
+    if (!res.ok) return { products: [], error: `HTTP ${res.status}` };
+    const json = await res.json();
+    return { products: (json.products || []).filter(p => p && p.id && p.handle).map(normalizeProduct), error: null };
+  } catch (e) {
+    return { products: [], error: e.message };
+  }
+}
+
+function normalizeProduct(p) {
+  const variants = Array.isArray(p.variants) ? p.variants : [];
+  const knownStock = variants.filter(v => typeof v.available === 'boolean');
+  let availability = 'unknown'; // 公開データに在庫情報が無い場合
+  if (knownStock.some(v => v.available)) availability = 'in_stock';
+  else if (knownStock.length > 0 && knownStock.length === variants.length) availability = 'sold_out';
+  return {
+    id: String(p.id),
+    title: String(p.title || ''),
+    handle: p.handle,
+    url: `${CONFIG.SHOP_BASE_URL}/products/${p.handle}`,
+    vendor: String(p.vendor || ''),
+    productType: String(p.product_type || ''),
+    tags: Array.isArray(p.tags) ? p.tags.map(String) : String(p.tags || '').split(',').map(t => t.trim()).filter(Boolean),
+    description: htmlToText(p.body_html),
+    images: (p.images || []).map(img => img && img.src).filter(Boolean).slice(0, CONFIG.MAX_IMAGES),
+    price: variants[0]?.price ?? '',
+    availability,
+    publishedAt: p.published_at || ''
+  };
 }
 
 /**
- * 投稿の構成: 導入+商品紹介(Geminiが作る本文)→「▼詳細はこちら」→ 商品URL → ハッシュタグ。
- * URLとハッシュタグは誤りが出ないようコード側で付ける。
+ * 候補を先頭から1件ずつ確認し、確認できた商品を返す関数を作る。
+ * 確認できなかった商品は stats.verifyFailures に理由と一緒に残し、MAX_VERIFY_FAILURES 件で打ち切る。
  */
-async function composePost(products) {
-  const draft = await generateDraftWithGemini(products);
-  const product = products.find(p => p.handle === draft.product_handle) || products[0];
-  const productUrl = `${CONFIG.SHOP_BASE_URL}/products/${product.handle}`;
-  draft.message = `${draft.body}\n\n▼詳細はこちら\n${productUrl}\n\n${CONFIG.HASHTAGS}`;
-  return { draft, product, productUrl };
+function createVerifiedProductSource(pool, stats) {
+  let index = 0;
+  stats.verifyFailures = [];
+  return async function nextVerified() {
+    while (index < pool.length && stats.verifyFailures.length < CONFIG.MAX_VERIFY_FAILURES) {
+      const product = pool[index++];
+      const result = await verifyProduct(product);
+      if (result.ok) return result.product;
+      stats.verifyFailures.push({ title: product.title, url: product.url, checks: result.checks });
+      log(`確認できなかったため使いません: ${product.title}(${result.checks.filter(c => !c.ok).map(c => `${c.label}: ${c.detail}`).join(' / ')})`);
+    }
+    return null;
+  };
 }
 
-function describeAnniversary(draft) {
-  if (!draft.anniversary) return 'なし(通常の商品紹介)';
-  return String(draft.anniversary_used) === 'true'
-    ? `${draft.anniversary}(使用)`
-    : `${draft.anniversary}(関連が弱いため不使用)`;
+/**
+ * 商品を3段階で確認する(読み取りのみ)。どれかに失敗したら使わない。
+ * 1. 単品データ(/products/<handle>.js)を取り直し、一覧と ID・handle・商品名が一致するか
+ * 2. 商品ページ(/products/<handle>)が商品ページとして表示されるか(HTTP 200 だけで判断しない)
+ * 3. 画像が Shopify の画像配信サーバーのもので、同じ商品の画像として登録されていて、画像として読めるか
+ * 返す商品の説明文・在庫・画像は、確認に使った同じ商品のデータだけで組み立てる。
+ */
+async function verifyProduct(listed) {
+  const checks = [];
+  const check = (label, ok, detail = '') => {
+    checks.push({ label, ok, detail });
+    return ok;
+  };
+  const fail = () => ({ ok: false, checks });
+
+  // 1. 単品データとの照合
+  let single;
+  try {
+    const res = await politeFetch(`${CONFIG.SHOP_BASE_URL}/products/${encodeURIComponent(listed.handle)}.js`);
+    if (!check('商品データ', res.ok, `HTTP ${res.status}`)) return fail();
+    single = await res.json();
+  } catch (e) {
+    check('商品データ', false, e.message);
+    return fail();
+  }
+  const same = String(single.id) === listed.id && single.handle === listed.handle && norm(single.title) === norm(listed.title);
+  if (!check('商品データの照合(ID・handle・商品名)', same, same
+    ? `ID ${listed.id}`
+    : `一覧 ${listed.id} / ${listed.handle} / ${listed.title} と 単品 ${single.id} / ${single.handle} / ${single.title} が一致しない`)) return fail();
+
+  const product = { ...listed };
+  if (typeof single.available === 'boolean') product.availability = single.available ? 'in_stock' : 'sold_out';
+  if (!check('在庫', product.availability !== 'sold_out', AVAILABILITY_LABELS[product.availability])) return fail();
+  const description = htmlToText(single.description);
+  if (description) product.description = description; // 同じ商品IDの単品データの説明文を正とする
+  if (!check('説明文', compact(product.description).length >= CONFIG.MIN_DESCRIPTION_CHARS,
+    `${compact(product.description).length}文字`)) return fail();
+
+  // 2. 商品ページの表示
+  const page = await checkProductPage(product);
+  if (!check('商品ページ', page.ok, page.detail)) return fail();
+
+  // 3. 画像(Shopifyの画像配信サーバー・同じ商品の画像・画像として読める)
+  const registered = new Set((single.images || []).map(imageFileName).filter(Boolean));
+  const images = [];
+  for (const src of listed.images) {
+    const host = safeHost(src);
+    if (!IMAGE_HOSTS.includes(host)) {
+      check('画像', false, `Shopifyの画像配信サーバー以外の画像は使いません: ${host || src}`);
+      continue;
+    }
+    if (!registered.has(imageFileName(src))) {
+      check('画像', false, `単品データに登録されていない画像: ${imageFileName(src)}`);
+      continue;
+    }
+    const r = await checkImage(src);
+    check('画像', r.ok, r.ok ? imageFileName(src) : `${imageFileName(src)}: ${r.detail}`);
+    if (r.ok) images.push(src);
+  }
+  if (images.length === 0) {
+    check('使える画像', false, '確認できた画像がありません');
+    return fail();
+  }
+  product.images = images;
+  product.verification = checks;
+  // 画像の一部が使えないだけなら商品は使う(使えた画像だけを表示する)
+  return { ok: true, product, checks };
 }
 
-function renderPreviewHtml({ draft, product, productUrl, candidateCount }) {
+/** 商品ページが「その商品のページ」として表示されるかを、HTML の中身で確かめる */
+async function checkProductPage(product) {
+  let res;
+  let html = '';
+  try {
+    res = await politeFetch(product.url);
+    html = res.ok ? await res.text() : '';
+  } catch (e) {
+    return { ok: false, detail: e.message };
+  }
+  if (!res.ok) return { ok: false, detail: `HTTP ${res.status}` };
+  const type = res.headers?.get?.('content-type') || '';
+  if (!type.includes('text/html')) return { ok: false, detail: `HTMLではありません(${type || '不明'})` };
+  const finalPath = decodeURIComponent(new URL(res.url || product.url).pathname);
+  if (!finalPath.endsWith(`/products/${product.handle}`)) return { ok: false, detail: `別のページに転送されました: ${finalPath}` };
+
+  const titleTag = decodeEntities((html.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1] || '');
+  const ogTitle = decodeEntities(metaContent(html, 'og:title'));
+  const ogType = metaContent(html, 'og:type');
+  if (/ページが見つかりません|見つかりませんでした|404|not found/i.test(titleTag)) {
+    return { ok: false, detail: `「見つかりません」ページでした(${compactSpaces(titleTag).slice(0, 60)})` };
+  }
+  if (ogType !== 'product') return { ok: false, detail: `商品ページの目印(og:type=product)がありません(${ogType || 'なし'})` };
+  if (!norm(ogTitle + titleTag).includes(norm(product.title))) {
+    return { ok: false, detail: `ページの商品名が一致しません(${compactSpaces(ogTitle || titleTag).slice(0, 60)})` };
+  }
+  return { ok: true, detail: '商品名・商品ページの目印を確認' };
+}
+
+/**
+ * 画像を読み取りで確認する(HEAD。使えない場合だけ GET)。
+ * アクセス制限(429/503)のときは再試行せず、以後その実行では画像の確認をやめてエラーにする。
+ */
+let imageHostLimited = false;
+async function checkImage(src) {
+  if (imageHostLimited) return { ok: false, detail: 'アクセス制限中のため確認していません' };
+  try {
+    let res = await politeFetch(src, { method: 'HEAD', retry: false });
+    if (res.status === 405 || res.status === 403) res = await politeFetch(src, { retry: false });
+    if (res.status === 429 || res.status === 503) {
+      imageHostLimited = true;
+      return { ok: false, detail: `アクセス制限(HTTP ${res.status})のため確認できませんでした(再試行しません)` };
+    }
+    if (!res.ok) return { ok: false, detail: `HTTP ${res.status}` };
+    const type = res.headers?.get?.('content-type') || '';
+    if (!type.startsWith('image/')) return { ok: false, detail: `画像ではありません(${type || '不明'})` };
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, detail: e.message };
+  }
+}
+
+function metaContent(html, property) {
+  for (const tag of html.match(/<meta\b[^>]*>/gi) || []) {
+    if (new RegExp(`(property|name)=["']${property}["']`, 'i').test(tag)) {
+      return (tag.match(/content=["']([^"']*)["']/i) || [])[1] || '';
+    }
+  }
+  return '';
+}
+
+/** 画像URLのファイル名(?v= などは除く)。一覧と単品データで同じ画像かを比べるのに使う */
+function imageFileName(src) {
+  try {
+    return new URL(String(src), 'https://example.invalid').pathname.split('/').pop() || '';
+  } catch {
+    return '';
+  }
+}
+
+function safeHost(src) {
+  try {
+    return new URL(String(src)).host;
+  } catch {
+    return '';
+  }
+}
+
+/** 投稿文の根拠として使ってよい商品情報の文章 */
+function productSourceText(p) {
+  return [p.title, p.vendor, p.productType, p.tags.join(' '), p.description].join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// 今日は何の日(雑学ネタ帳)
+// ---------------------------------------------------------------------------
+
+async function fetchAnniversaries(dates) {
+  const result = {};
+  const robots = await zatsunetaRobotsAllows('/archives/');
+  for (const date of dates) {
+    if (!robots.allowed) {
+      result[date] = { ok: false, items: [], error: robots.reason };
+      continue;
+    }
+    const [, mm, dd] = date.split('-');
+    const url = `${CONFIG.ZATSUNETA_BASE_URL}/archives/a${mm}${dd}.html`;
+    try {
+      const res = await politeFetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const items = parseAnniversaryList(await res.text(), Number(mm), Number(dd));
+      result[date] = items.length
+        ? { ok: true, items, url }
+        : { ok: false, items: [], url, error: '記念日を読み取れませんでした(ページ構成が変わった可能性)' };
+    } catch (e) {
+      result[date] = { ok: false, items: [], url, error: e.message };
+    }
+  }
+  return result;
+}
+
+/** 日付ページのリンク(title="記念日名(M月D日 記念日)")から、その日の記念日を取り出す */
+function parseAnniversaryList(html, month, day) {
+  const items = [];
+  const re = /<a\s+href="([^"]+)"\s+title="([^"]+?)（(\d+)月(\d+)日 記念日）"/g;
+  for (const m of html.matchAll(re)) {
+    if (Number(m[3]) !== month || Number(m[4]) !== day) continue;
+    const name = decodeEntities(m[2]).trim();
+    if (!items.some(i => i.name === name)) items.push({ name, url: m[1] });
+  }
+  return items.slice(0, CONFIG.MAX_ANNIVERSARIES_PER_DAY);
+}
+
+/** 記念日の個別ページから冒頭の説明(text_intro)を取り出す。取れなければ null */
+async function fetchAnniversaryDetail(url) {
+  if (!url.startsWith(`${CONFIG.ZATSUNETA_BASE_URL}/archives/`)) return null;
+  try {
+    const res = await politeFetch(url);
+    if (!res.ok) return null;
+    const m = (await res.text()).match(/<div id="text_intro">([\s\S]*?)<\/div>/);
+    const text = m ? htmlToText(m[1]).slice(0, 300) : '';
+    return text || null;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveAnniversary(date, assignment, day) {
+  if (!assignment.anniversaryName) return null;
+  const item = day?.items.find(i => i.name === assignment.anniversaryName);
+  if (!item) return null;
+  const description = await fetchAnniversaryDetail(item.url);
+  if (!description) {
+    log(`${date} の記念日「${item.name}」の説明を取得できなかったため使用しません`);
+    return null;
+  }
+  return { name: item.name, url: item.url, description };
+}
+
+let robotsCache = null;
+async function zatsunetaRobotsAllows(path) {
+  if (robotsCache) return robotsCache;
+  try {
+    const res = await politeFetch(`${CONFIG.ZATSUNETA_BASE_URL}/robots.txt`);
+    if (res.status === 404) return (robotsCache = { allowed: true });
+    if (!res.ok) return (robotsCache = { allowed: false, reason: `robots.txt を確認できませんでした(HTTP ${res.status})` });
+    const disallows = parseRobotsDisallows(await res.text());
+    const blocked = disallows.some(d => d === '/' || path.startsWith(d));
+    return (robotsCache = blocked
+      ? { allowed: false, reason: 'robots.txt で取得が許可されていません' }
+      : { allowed: true });
+  } catch (e) {
+    return (robotsCache = { allowed: false, reason: `robots.txt を確認できませんでした(${e.message})` });
+  }
+}
+
+/** User-agent: * のグループの Disallow を取り出す(空の Disallow は「すべて許可」なので除く) */
+function parseRobotsDisallows(text) {
+  const disallows = [];
+  let applies = false;
+  let inAgents = false;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.replace(/#.*/, '').trim();
+    const m = line.match(/^([A-Za-z-]+)\s*:\s*(.*)$/);
+    if (!m) continue;
+    const key = m[1].toLowerCase();
+    if (key === 'user-agent') {
+      if (!inAgents) applies = false;
+      inAgents = true;
+      if (m[2].trim() === '*') applies = true;
+      continue;
+    }
+    inAgents = false;
+    if (applies && key === 'disallow' && m[2].trim()) disallows.push(m[2].trim());
+  }
+  return disallows;
+}
+
+// ---------------------------------------------------------------------------
+// 商品の割り当てと投稿文の生成(Gemini)
+// ---------------------------------------------------------------------------
+
+/**
+ * 選んだ商品を各日付に割り当てる。記念日と自然につながる商品があればその日に置く。
+ * 返ってきた内容が不正なら、記念日なしで順番に割り当てる。
+ */
+async function assignProducts(apiKey, dates, products, anniversaries) {
+  const slots = dates.slice(0, products.length);
+  const fallback = note => ({
+    assignments: slots.map((date, i) => ({ date, product: products[i], anniversaryName: '', reason: '' })),
+    note
+  });
+  if (slots.length === 0) return { assignments: [], note: null };
+
+  const prompt = `
+あなたは「ふくしま市場」(福島県産品のオンラインストア)のSNS担当者です。
+次の商品を、各投稿日に1つずつ割り当ててください(すべての商品を1回ずつ使う)。
+
+各日の記念日リストに、商品と強く自然に関連するもの(例: 商品そのものや原材料の記念日)があれば、
+その日にその商品を置き、記念日名を anniversary に入れる。
+関連が弱い・こじつけになる場合は anniversary を空文字にする。記念日はリストにある名前だけを使う。
+
+投稿日と記念日:
+${slots.map(d => `- ${d}(${weekdayJa(d)}): ${anniversaries[d]?.ok ? anniversaries[d].items.map(i => i.name).join('、') : '(記念日情報なし)'}`).join('\n')}
+
+商品:
+${products.map(p => `- 商品ID: ${p.id} / ${p.title} / 種別: ${p.productType || '-'} / タグ: ${p.tags.join('、') || '-'} / 説明: ${compactSpaces(p.description).slice(0, 120)}`).join('\n')}
+
+出力は次のJSON形式のみ。
+{"assignments": [{"date": "YYYY-MM-DD", "product_id": "商品ID", "anniversary": "記念日名または空文字", "reason": "記念日を使う/使わない理由を一言"}]}
+`;
+  let data;
+  try {
+    ({ data } = await callGeminiJson(apiKey, prompt));
+  } catch (e) {
+    log('商品の割り当てに失敗したため、記念日なしで順番に割り当てます: ' + e.message);
+    return fallback('Gemini による割り当てに失敗したため、記念日なしで順番に割り当てました');
+  }
+
+  const list = Array.isArray(data.assignments) ? data.assignments : [];
+  const used = new Set();
+  const assignments = [];
+  for (const date of slots) {
+    const a = list.find(x => String(x.date) === date);
+    const product = a && products.find(p => p.id === String(a.product_id));
+    if (!product || used.has(product.id)) {
+      return fallback('Gemini の割り当て結果が不正だったため、記念日なしで順番に割り当てました');
+    }
+    used.add(product.id);
+    const name = String(a.anniversary || '');
+    const valid = name && anniversaries[date]?.items.some(i => i.name === name);
+    assignments.push({ date, product, anniversaryName: valid ? name : '', reason: String(a.reason || '') });
+  }
+  return { assignments, note: null };
+}
+
+/**
+ * 1日分の投稿文を作る。ルールや事実確認に通らなければ作り直させ、それでも駄目なら予備の商品に差し替える。
+ * どうしても通らない場合は、一番ましな案を「要確認」として返す(履歴には記録しない)。
+ */
+async function generateForSlot(apiKey, slot, nextVerified, avoid, weekPosts = []) {
+  const replaced = [];
+  let best = null;
+  let lastError = null;
+  for (let s = 0; s <= CONFIG.MAX_PRODUCT_SWITCHES; s++) {
+    const product = s === 0 ? slot.product : await nextVerified();
+    if (!product) break;
+    let bestStyle = null;
+    const anniversary = s === 0 ? slot.anniversary : null; // 差し替え後の商品には記念日を使わない
+    const prompt = buildPostPrompt(slot.date, product, anniversary, avoid, weekPosts);
+    let feedback = '';
+    let errored = false;
+    for (let attempt = 1; attempt <= CONFIG.GEMINI_MAX_ATTEMPTS; attempt++) {
+      let data;
+      let model;
+      try {
+        ({ data, model } = await callGeminiJson(apiKey, prompt + feedback));
+      } catch (e) {
+        lastError = e.message;
+        errored = true;
+        break;
+      }
+      const post = evaluatePost(data, slot.date, product, anniversary, avoid);
+      Object.assign(post, { date: slot.date, product, anniversary, model, attempts: attempt, replaced: [...replaced] });
+      if (post.ok && post.styleIssues.length === 0) return post;
+      if (post.ok && (!bestStyle || post.styleIssues.length < bestStyle.styleIssues.length)) bestStyle = post;
+      if (!best || problemCount(post) < problemCount(best)) best = post;
+      const problems = [...post.issues, ...post.factIssues, ...post.styleIssues];
+      feedback = `\n\n前回の本文には次の問題がありました。直して書き直してください:\n- ${problems.join('\n- ')}\n前回の本文:\n${post.body}\n`;
+      log(`${slot.date} ${product.title}: 作り直します(${attempt}回目): ${problems.join(' / ')}`);
+    }
+    // ルール・事実確認に通った案があれば、言い回しの注意が残っていても商品は差し替えない
+    if (bestStyle) return bestStyle;
+    if (errored && !best) {
+      // Gemini 自体のエラーは商品を替えても直らないことが多いので、この日は失敗にする
+      return { date: slot.date, failed: true, error: `Gemini APIエラー: ${lastError}`, product, replaced };
+    }
+    replaced.push({ title: product.title, reason: errored ? 'Gemini APIエラー' : 'ルール・事実確認を満たせなかった' });
+  }
+  if (best) return { ...best, ok: false, needsReview: true, replaced };
+  return { date: slot.date, failed: true, error: lastError ? `Gemini APIエラー: ${lastError}` : '確認できた候補商品が足りませんでした', replaced };
+}
+
+function problemCount(post) {
+  return post.issues.length + post.factIssues.length * 2;
+}
+
+/**
+ * 週全体の類似チェック。似すぎた組は後ろの投稿を書き直す(上限 WEEK_REWRITE_LIMIT 件)。
+ * 書き直し案はルール・事実確認に通り、かつ他の投稿と似ていない場合だけ採用する。
+ * 残った類似は各投稿の similarity に入れてプレビューに表示する(履歴の記録は止めない)。
+ */
+async function reviewWeek(apiKey, slotPosts, historyPhrases, results) {
+  const usable = () => slotPosts.map(p => results.get(p.date)).filter(p => p && !p.failed);
+  const before = findSimilarities(usable());
+  const rewritten = [];
+  const targets = [...before.keys()].slice(0, CONFIG.WEEK_REWRITE_LIMIT);
+  for (const date of targets) {
+    const post = results.get(date);
+    const reasons = before.get(date);
+    const others = usable().filter(p => p.date !== date);
+    const avoid = {
+      openings: [...historyPhrases.openings, ...others.map(p => p.opening)],
+      closings: [...historyPhrases.closings, ...others.map(p => p.closing)]
+    };
+    const prompt = buildPostPrompt(date, post.product, post.anniversary, avoid, others);
+    let feedback = `\n\nこの投稿は、同じ週のほかの投稿と次の点が似ています。見出しの言い回し・構成・切り口・終わり方を変えて書き直してください(事実は商品説明の範囲だけ):\n- ${reasons.join('\n- ')}\n今の本文:\n${post.body}\n`;
+    let adopted = null;
+    for (let attempt = 1; attempt <= CONFIG.WEEK_REWRITE_ATTEMPTS && !adopted; attempt++) {
+      let data;
+      let model;
+      try {
+        ({ data, model } = await callGeminiJson(apiKey, prompt + feedback));
+      } catch (e) {
+        log(`${date} 類似の書き直しに失敗しました: ${e.message}`);
+        break;
+      }
+      const candidate = evaluatePost(data, date, post.product, post.anniversary, avoid);
+      const stillSimilar = findSimilarities([...others, { ...candidate, date, product: post.product }]).get(date) || [];
+      if (candidate.ok && candidate.styleIssues.length === 0 && stillSimilar.length === 0) {
+        adopted = Object.assign(candidate, {
+          date, product: post.product, anniversary: post.anniversary, model, attempts: post.attempts,
+          replaced: post.replaced, needsReview: post.needsReview && !candidate.ok, rewrittenFor: reasons
+        });
+      } else {
+        const why = [...candidate.issues, ...candidate.factIssues, ...candidate.styleIssues, ...stillSimilar];
+        feedback = `\n\n書き直し案にはまだ次の問題があります。直してください:\n- ${why.join('\n- ')}\n書き直し案:\n${candidate.body}\n`;
+        log(`${date} 類似の書き直し(${attempt}回目)を採用しませんでした: ${why.join(' / ')}`);
+      }
+    }
+    if (adopted) {
+      results.set(date, adopted);
+      rewritten.push({ date, reasons });
+      log(`${date} 似すぎていたため書き直しました: ${reasons.join(' / ')}`);
+    }
+  }
+  const after = findSimilarities(usable());
+  for (const p of usable()) p.similarity = after.get(p.date) || [];
+  return { checked: before.size, rewritten, remaining: after.size, skipped: Math.max(0, before.size - CONFIG.WEEK_REWRITE_LIMIT) };
+}
+
+/**
+ * 投稿どうしの似すぎを調べる。返り値は 日付 → 理由の配列(似ている組の後ろ側の投稿に付ける)。
+ * - 見出し・最後の一文: 商品名などの固有の言葉を除いた言い回しが SIMILARITY_JACCARD 以上似ている
+ * - 文末: 最後の一文の終わり4文字が同じ投稿が SAME_ENDING_LIMIT を超える
+ * - 構成(段落数と各段落の文数)・切り口: 同じものがそれぞれの上限を超える
+ */
+function findSimilarities(posts) {
+  const found = new Map();
+  const add = (date, reason) => {
+    if (!found.has(date)) found.set(date, []);
+    if (!found.get(date).includes(reason)) found.get(date).push(reason);
+  };
+  const label = p => formatDateJa(p.date);
+  for (let i = 0; i < posts.length; i++) {
+    for (let j = 0; j < i; j++) {
+      const a = posts[j];
+      const b = posts[i];
+      if (jaccard(phraseTemplate(a.opening, a.product), phraseTemplate(b.opening, b.product)) >= CONFIG.SIMILARITY_JACCARD) {
+        add(b.date, `見出しの言い回しが${label(a)}と似ている(「${a.opening}」/「${b.opening}」)`);
+      }
+      if (jaccard(phraseTemplate(a.lastSentence, a.product), phraseTemplate(b.lastSentence, b.product)) >= CONFIG.SIMILARITY_JACCARD) {
+        add(b.date, `最後の一文が${label(a)}と似ている(「${a.lastSentence}」/「${b.lastSentence}」)`);
+      }
+    }
+  }
+  const overLimit = (key, limit, describe) => {
+    const groups = new Map();
+    for (const p of posts) {
+      const k = key(p);
+      if (!k) continue;
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push(p);
+    }
+    for (const [k, group] of groups) {
+      if (group.length <= limit) continue;
+      for (const p of group.slice(limit)) add(p.date, describe(k, group));
+    }
+  };
+  overLimit(p => phraseKey(p.lastSentence).slice(-4), CONFIG.SAME_ENDING_LIMIT,
+    (k, g) => `文末「…${k}」が${g.length}件で同じ(${g.map(label).join('、')})`);
+  overLimit(p => p.signature, CONFIG.SAME_STRUCTURE_LIMIT,
+    (k, g) => `構成(${k})が${g.length}件で同じ(${g.map(label).join('、')})`);
+  overLimit(p => (p.focus && p.focus !== 'その他' ? p.focus : ''), CONFIG.SAME_FOCUS_LIMIT,
+    (k, g) => `切り口「${k}」が${g.length}件で同じ(${g.map(label).join('、')})`);
+  return found;
+}
+
+/** 本文の形: 段落ごとの文の数(見出しは H)と、最後の一文 */
+function bodyShape(body) {
+  const paragraphs = String(body).split(/\n\s*\n/).map(s => s.trim()).filter(Boolean);
+  const sentencesOf = text => text.replace(/\n/g, '').split(/(?<=[。!?！？♪])/).map(s => s.trim()).filter(Boolean);
+  const rest = paragraphs.slice(1);
+  const signature = ['H', ...rest.map(p => sentencesOf(p).length)].join('-');
+  const lastParagraph = paragraphs.at(-1) || '';
+  const lastSentence = sentencesOf(lastParagraph).at(-1) || lastParagraph;
+  return { signature, lastSentence };
+}
+
+/** 比較用の言い回し: 商品名・タグなどの固有の言葉と「」の中身を除き、記号・空白も除く */
+function phraseTemplate(text, product) {
+  let s = String(text || '').normalize('NFKC').replace(/「[^」]*」/g, '');
+  const words = [product?.title, product?.vendor, product?.productType, ...(product?.tags || [])]
+    .flatMap(w => String(w || '').normalize('NFKC').split(/[\s【】\[\]()（）「」・/,、]+/))
+    .filter(w => w.length >= 2)
+    .sort((x, y) => y.length - x.length);
+  for (const w of words) s = s.split(w).join('');
+  return phraseKey(s);
+}
+
+/** 文字の2-gram の重なり(0〜1)。短すぎる文は比べない */
+function jaccard(a, b) {
+  if (a.length < 4 || b.length < 4) return 0;
+  const grams = s => new Set(Array.from({ length: s.length - 1 }, (_, i) => s.slice(i, i + 2)));
+  const x = grams(a);
+  const y = grams(b);
+  let inter = 0;
+  for (const g of x) if (y.has(g)) inter++;
+  return inter / (x.size + y.size - inter);
+}
+
+function buildPostPrompt(date, product, anniversary, avoid, weekPosts = []) {
+  const examples = loadStyleExamples();
+  return `
+あなたは「ふくしま市場」(福島県産品のオンラインストア)のSNS担当者です。
+${formatDateJa(date)}に投稿するFacebook投稿の本文を、担当者が自分の言葉でこの商品を紹介するように書いてください。
+
+雰囲気の参考(短く自然で読みやすい文章の例。構成・言い回し・締め方はまねしない):
+<<<
+${STYLE_REFERENCE}
+>>>
+
+書き方:
+- まず商品説明を読み、この商品でいちばん伝えたい点を1〜2つに絞る。切り口は ${CONFIG.FOCUS_TYPES.join('・')} から、商品説明に書かれているものを選ぶ
+- 構成は商品に合わせて決める。毎回「見出し→産地→特徴→締め」の順にしない
+  (例: 食べ方から書き始める/製法の話を中心にする/特徴を1つだけ深く書く/背景を短く添えて特徴で終える)
+- 締めの一文は必須ではない。魅力が伝わっていれば、特徴の説明で終えてよい。
+  締める場合は、商品説明に根拠のある具体的な食べ方・使い道で締める
+- 次のような定型表現に頼らない: ${CONFIG.STOCK_PHRASES.join('、')}
+- 見出しは1行(絵文字は0〜1個)で、この商品ならではの言葉にする。「〜のご紹介」「〜が入荷しました」「〇〇の魅力」のような型にしない
+- 商品説明の文をそのまま写さず、短く読みやすい言葉に言い換える(意味は変えない)
+- 商品説明にない味・食感・香り・食べ方・使い道・産地・製法・生産者・数量・受賞歴・季節限定などは書かない(創作しない)
+- 文字数を稼ぐための文は足さない。伝えることが少なければ短くてよい
+
+改行のしかた:
+- 見出しのあとに空行を1つ入れる
+- 本文は1〜3段落。段落の間にだけ空行を1つ入れ、1文ごとに空行で区切らない。同じ段落の文は改行せずに続ける
+- 空行を2つ以上続けない。行頭・行末に空白を入れない
+${weekPosts.length ? `
+この週のほかの投稿(見出しの言い回し・構成・切り口・終わり方が似ないようにする):
+${weekPosts.map(w => `- 見出し「${w.opening}」/ 最後の一文「${w.lastSentence}」/ 構成 ${w.signature} / 切り口 ${w.focus || '-'}`).join('\n')}
+` : ''}${examples.length ? `\n公式Xの投稿例(雰囲気の参考。文章をそのまま流用しない):\n${examples.map(e => `---\n${e}`).join('\n')}\n---\n` : ''}
+商品情報(事実はここに書かれていることだけを使う):
+商品ID: ${product.id}
+商品名: ${product.title}
+販売者: ${product.vendor || '(なし)'}
+種別: ${product.productType || '(なし)'}
+タグ: ${product.tags.join('、') || '(なし)'}
+商品説明:
+<<<
+${product.description.slice(0, 2500)}
+>>>
+
+${anniversary
+    ? `この日の記念日: ${anniversary.name}
+記念日の説明(雑学ネタ帳より):
+${anniversary.description}
+商品と自然につながる場合だけ、導入で短く触れてよい。記念日の事実は上の説明だけを根拠にする。
+つながりが弱いと感じたら使わずに通常の商品紹介にし、anniversary_used を false にする。`
+    : 'この日は記念日を使わず、通常の商品紹介にする(anniversary_used は false)。'}
+
+ルール:
+- 本文(見出しを含む)は改行・空白を除いて${CONFIG.BODY_MIN_CHARS}〜${CONFIG.BODY_MAX_CHARS}文字が目安。自然さを優先し、情報が少なければ無理に増やさない。${CONFIG.BODY_MAX_CHARS}文字は超えない
+- 商品名・産地・製法・生産者・数量・特徴などの事実は、上の商品情報に書かれていることだけを使う。書かれていないことを推測で足さない
+- 絵文字は0〜${CONFIG.MAX_EMOJI}個
+- 誇張表現や不自然な宣伝文句(${CONFIG.NG_PHRASES.slice(0, 8).join('、')} など)は使わない
+- 「▼詳細はこちら」、URL、ハッシュタグは本文に入れない(後から自動で付ける)
+${avoid.openings.length ? `- 次の書き出しと似た1行目にしない:\n${avoid.openings.map(o => `  ・${o}`).join('\n')}` : ''}
+${avoid.closings.length ? `- 次の締めくくりと似た最後の一言にしない:\n${avoid.closings.map(o => `  ・${o}`).join('\n')}` : ''}
+- hashtags には ${CONFIG.FIXED_HASHTAGS.join(' ')} 以外のハッシュタグをちょうど${CONFIG.EXTRA_HASHTAGS}個入れる。地域名・商品名・商品ジャンルなどから、商品情報に実際に書かれている言葉を使う
+- claims には本文に書いた事実(特徴・産地・製法・数量・生産者など)を1つずつ挙げ、evidence に根拠となる商品情報の文を一字一句そのまま引用する
+
+出力は次のJSON形式のみ。前後に説明文やコードブロック記号は一切つけないこと。
+{"body": "本文", "hashtags": ["#...", "#..."], "focus": "選んだ切り口(${CONFIG.FOCUS_TYPES.join(' / ')} のどれか)", "anniversary_used": true または false, "anniversary_reason": "記念日を使った/使わなかった理由を一言", "claims": [{"text": "本文中の記述", "evidence": "商品情報からのそのままの引用"}]}
+`;
+}
+
+/**
+ * Gemini の出力を検査する。
+ * issues: 作り直しが必要なルール違反 / factIssues: 根拠が確認できない記述 /
+ * styleIssues: 定型表現・言い回しの重複(作り直させるが、直らなければ注意として残す) / notes: 参考の注意(作り直さない)
+ */
+function evaluatePost(data, date, product, anniversary, avoid) {
+  const body = cleanBody(data.body);
+  const lines = body.split('\n').map(l => l.trim()).filter(Boolean);
+  const opening = lines[0] || '';
+  const shape = bodyShape(body);
+  const closing = shape.lastSentence;
+  const focus = CONFIG.FOCUS_TYPES.includes(String(data.focus)) ? String(data.focus) : 'その他';
+  const bodyChars = countBodyChars(body);
+  const emojiCount = countEmoji(body);
+  const extraTags = (Array.isArray(data.hashtags) ? data.hashtags : [])
+    .map(t => String(t).trim()).filter(Boolean)
+    .map(t => (t.startsWith('#') || t.startsWith('＃') ? '#' + t.slice(1) : '#' + t));
+  const hashtags = [...CONFIG.FIXED_HASHTAGS, ...extraTags];
+  const issues = [];
+  const factIssues = [];
+  const styleIssues = []; // 定型表現・書き出し/締めの重複。作り直させるが、直らなくても商品は差し替えない
+  const notes = [];
+
+  if (!body) issues.push('本文が空です');
+  if (bodyChars > CONFIG.BODY_MAX_CHARS) issues.push(`本文が${bodyChars}文字です(${CONFIG.BODY_MAX_CHARS}文字以内)`);
+  if (body && bodyChars < CONFIG.BODY_MIN_CHARS) notes.push(`本文が${bodyChars}文字で目安(${CONFIG.BODY_MIN_CHARS}文字)より短め(魅力が伝わっていれば問題なし)`);
+  if (emojiCount > CONFIG.MAX_EMOJI) issues.push(`絵文字が${emojiCount}個です(${CONFIG.MAX_EMOJI}個まで)`);
+  const ng = CONFIG.NG_PHRASES.filter(p => body.includes(p));
+  if (ng.length) issues.push(`誇張・宣伝的な表現: ${ng.join('、')}`);
+  const stock = CONFIG.STOCK_PHRASES.filter(p => body.includes(p));
+  if (stock.length) styleIssues.push(`定型表現: ${stock.join('、')}(商品ならではの言葉にするか、締めの一文をなくす)`);
+
+  // ハッシュタグ: 固定2個+商品情報にある言葉2個
+  const sourceNorm = norm(productSourceText(product));
+  if (extraTags.length !== CONFIG.EXTRA_HASHTAGS) {
+    issues.push(`追加のハッシュタグが${extraTags.length}個です(${CONFIG.EXTRA_HASHTAGS}個)`);
+  }
+  for (const tag of extraTags) {
+    const word = tag.slice(1);
+    if (!/^#[^\s#]+$/.test(tag)) issues.push(`ハッシュタグの形式が不正: ${tag}`);
+    else if (CONFIG.FIXED_HASHTAGS.includes(tag)) issues.push(`固定のハッシュタグと重複: ${tag}`);
+    else if (!sourceNorm.includes(norm(word))) issues.push(`商品情報にない言葉のハッシュタグ: ${tag}`);
+  }
+  if (new Set(hashtags).size !== hashtags.length) issues.push('ハッシュタグが重複しています');
+
+  // 事実確認: 引用が商品情報に含まれるか、本文の数字が商品情報(と記念日の説明・日付)にあるか
+  const claims = (Array.isArray(data.claims) ? data.claims : []).map(c => {
+    const evidence = String(c?.evidence || '');
+    return { text: String(c?.text || ''), evidence, found: Boolean(evidence) && sourceNorm.includes(norm(evidence)) };
+  });
+  if (claims.length === 0) factIssues.push('根拠の引用(claims)がありません');
+  for (const c of claims.filter(c => !c.found)) {
+    factIssues.push(`根拠が商品情報に見つかりません: 「${c.text || c.evidence}」`);
+  }
+  const [, mm, dd] = date.split('-').map(Number);
+  const numberSource = [productSourceText(product), anniversary?.name || '', anniversary?.description || '', `${mm}月${dd}日`].join('\n').normalize('NFKC');
+  for (const n of new Set(body.normalize('NFKC').match(/\d+(?:\.\d+)?/g) || [])) {
+    const re = new RegExp(`(^|[^0-9.])${n.replace('.', '\\.')}($|[^0-9])`);
+    if (!re.test(numberSource)) factIssues.push(`商品情報にない数字が本文にあります: ${n}`);
+  }
+
+  // 記念日
+  const anniversaryUsed = Boolean(anniversary) && String(data.anniversary_used) === 'true';
+  if (String(data.anniversary_used) === 'true' && !anniversary) issues.push('記念日を使わない日に記念日が使われています');
+
+  // 書き出し・締めくくりの重複
+  if (avoid.openings.some(o => similarStart(o, opening))) styleIssues.push(`書き出しが他の投稿と似ています: ${opening}`);
+  if (avoid.closings.some(c => similarEnd(c, closing))) styleIssues.push(`締めくくりが他の投稿と似ています: ${closing}`);
+
+  // コピー用の投稿文そのもの(プレビューの表示もこの文字列から作る)
+  const message = normalizeMessage(`${body}\n\n▼詳細はこちら\n${product.url}\n\n${hashtags.join(' ')}`);
+  return {
+    ok: issues.length === 0 && factIssues.length === 0,
+    body, message, hashtags, opening, closing, bodyChars, emojiCount, claims, focus,
+    lastSentence: shape.lastSentence, signature: shape.signature,
+    anniversaryUsed, anniversaryReason: String(data.anniversary_reason || ''),
+    issues, factIssues, styleIssues, notes
+  };
+}
+
+/**
+ * GEMINI_MODELS を先頭から試す。混雑(503)や上限(429)のときだけ次のモデルに切り替え、
+ * それ以外のエラーはそのまま止める。APIキーはヘッダーでのみ送り、ログには出さない。
+ */
+async function callGeminiJson(apiKey, prompt) {
+  let json;
+  let model;
+  for (model of CONFIG.GEMINI_MODELS) {
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { responseMimeType: 'application/json', temperature: 1.0 }
+      })
+    });
+    json = await res.json();
+    const transient = json.error && ['UNAVAILABLE', 'RESOURCE_EXHAUSTED'].includes(json.error.status);
+    if (!transient) break;
+    log(`Gemini ${model} が一時的に使えないため次のモデルを試します: ${json.error.code} ${json.error.status}`);
+  }
+  if (json.error) throw new Error(`(${model}) ${json.error.code} ${json.error.status}: ${json.error.message}`);
+
+  const rawText = json.candidates?.[0]?.content?.parts?.[0]?.text || '';
+  const cleaned = rawText.trim().replace(/^```(json)?/i, '').replace(/```$/, '').trim();
+  try {
+    return { data: JSON.parse(cleaned), model };
+  } catch {
+    throw new Error(`(${model}) 出力をJSONとして解析できませんでした: ${rawText.slice(0, 200)}`);
+  }
+}
+
+/** 本文に紛れ込んだ URL・ハッシュタグ・「▼詳細はこちら」を取り除く(後でコード側が付ける)。 */
+function cleanBody(body) {
+  return String(body || '')
+    .replace(/https?:\/\/\S+/g, '')
+    .replace(/▼?\s*詳細はこちら/g, '')
+    .replace(/(^|\s)[#＃][^\s#＃]+/g, '$1')
+    .split('\n').map(line => line.trim()).join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+/** 改行を \n にそろえ、行末の空白と、2つ以上続く空行・前後の空行を取り除く */
+function normalizeMessage(text) {
+  return String(text)
+    .replace(/\r\n?/g, '\n')
+    .split('\n').map(line => line.replace(/[ \t　]+$/, '')).join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function countBodyChars(body) {
+  return [...body.replace(/\s/g, '')].length;
+}
+
+function countEmoji(text) {
+  return (text.match(/\p{Extended_Pictographic}/gu) || []).length;
+}
+
+/** 比較用: 絵文字・記号・空白を除く */
+function phraseKey(s) {
+  return String(s || '').normalize('NFKC').replace(/[\p{Extended_Pictographic}\p{P}\p{S}\s]/gu, '');
+}
+
+function similarStart(a, b) {
+  const x = phraseKey(a);
+  const y = phraseKey(b);
+  return Boolean(x && y) && (x === y || (x.length >= 8 && y.length >= 8 && x.slice(0, 8) === y.slice(0, 8)));
+}
+
+function similarEnd(a, b) {
+  const x = phraseKey(a);
+  const y = phraseKey(b);
+  return Boolean(x && y) && (x === y || (x.length >= 8 && y.length >= 8 && x.slice(-8) === y.slice(-8)));
+}
+
+function loadStyleExamples() {
+  if (!existsSync(CONFIG.STYLE_EXAMPLES_FILE)) return [];
+  return readFileSync(CONFIG.STYLE_EXAMPLES_FILE, 'utf8')
+    .split(/^---\s*$/m)
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
+// ---------------------------------------------------------------------------
+// 履歴(候補 / 承認済み / 公開済み)
+// ---------------------------------------------------------------------------
+
+function loadHistory() {
+  if (!existsSync(CONFIG.HISTORY_FILE)) return { version: 2, entries: [] };
+  const data = JSON.parse(readFileSync(CONFIG.HISTORY_FILE, 'utf8'));
+  if (!data || !Array.isArray(data.entries)) {
+    // 壊れた履歴を上書きして消さないよう、ここで止める
+    throw new Error(`${CONFIG.HISTORY_FILE} の形式が不正です({"version":2,"entries":[...]} の形にしてください)。`);
+  }
+  for (const e of data.entries) {
+    if (!CONFIG.HISTORY_STATUSES.includes(e.status)) {
+      throw new Error(`${CONFIG.HISTORY_FILE} に不明な状態があります: ${e.status}(${CONFIG.HISTORY_STATUSES.join(' / ')})`);
+    }
+    // テストの記録が実データの履歴に紛れ込んでいたら、使わずに止める
+    if (!IS_MOCK && e.dataSource === 'mock') {
+      throw new Error(`${CONFIG.HISTORY_FILE} にテスト用データの記録(商品ID ${e.productId})が含まれているため中止しました。`);
+    }
+  }
+  return data;
+}
+
+function saveHistory(history) {
+  mkdirSync(dirname(resolve(CONFIG.HISTORY_FILE)), { recursive: true });
+  writeFileSync(CONFIG.HISTORY_FILE, JSON.stringify(history, null, 2) + '\n');
+}
+
+/**
+ * 投稿予定日の前後 REUSE_BLOCK_DAYS 日に選ばれている商品ID。
+ * 作り直す週(と同じ日付)の「候補」は置き換えるので含めない。
+ */
+function blockedProductIds(history, weekStart, dates) {
+  const from = addDays(dates[0], -CONFIG.REUSE_BLOCK_DAYS);
+  const to = addDays(dates.at(-1), CONFIG.REUSE_BLOCK_DAYS);
+  return new Set(history.entries
+    .filter(e => !isReplacedCandidate(e, weekStart, dates))
+    .filter(e => e.postDate >= from && e.postDate <= to)
+    .map(e => String(e.productId)));
+}
+
+function isReplacedCandidate(e, weekStart, dates) {
+  return e.status === 'candidate' && (e.week === weekStart || dates.includes(e.postDate));
+}
+
+/**
+ * 同じ週の候補を入れ替える。生成に成功した投稿だけを「候補」として記録する。
+ * 1件も成功しなかったとき(Gemini の障害など)は、前回の候補を残すため履歴を変更しない(null を返す)。
+ */
+function updateHistory(history, weekStart, dates, posts) {
+  const succeeded = posts.filter(p => p && !p.locked && !p.failed && p.ok);
+  if (succeeded.length === 0) return null;
+  const now = new Date().toISOString();
+  history.entries = history.entries.filter(e => !isReplacedCandidate(e, weekStart, dates));
+  let recorded = 0;
+  for (const p of succeeded) {
+    history.entries.push({
+      productId: p.product.id,
+      handle: p.product.handle,
+      title: p.product.title,
+      postDate: p.date,
+      week: weekStart,
+      status: 'candidate',
+      dataSource: CONFIG.DATA_SOURCE,
+      opening: p.opening,
+      closing: p.closing,
+      generatedAt: now
+    });
+    recorded++;
+  }
+  history.entries.sort((a, b) => a.postDate.localeCompare(b.postDate) || String(a.productId).localeCompare(String(b.productId)));
+  return recorded;
+}
+
+/** 直近の書き出し・締めくくり。作り直す週の候補は置き換えるので含めない。 */
+function recentPhrases(history, weekStart, dates) {
+  const recent = history.entries
+    .filter(e => !isReplacedCandidate(e, weekStart, dates))
+    .sort((a, b) => String(a.generatedAt || '').localeCompare(String(b.generatedAt || '')))
+    .slice(-CONFIG.RECENT_PHRASES_COUNT);
+  return {
+    openings: recent.map(e => e.opening).filter(Boolean),
+    closings: recent.map(e => e.closing).filter(Boolean)
+  };
+}
+
+// ---------------------------------------------------------------------------
+// HTML プレビュー
+// ---------------------------------------------------------------------------
+
+function slotTitle(p) {
+  if (p.locked) return p.entry.title;
+  if (p.failed) return p.product ? `(失敗)${p.product.title}` : '(失敗)';
+  return p.product.title;
+}
+
+function slotAnniversary(p) {
+  if (p.locked || p.failed) return '-';
+  if (p.anniversaryUsed) return p.anniversary.name;
+  return p.anniversary ? `不使用(${p.anniversary.name})` : 'なし';
+}
+
+function slotStatus(p) {
+  if (p.locked) return `${STATUS_LABELS[p.entry.status]}(作り直さない)`;
+  if (p.failed) return '失敗(履歴に記録しない)';
+  if (p.needsReview) return '要確認(履歴に記録しない)';
+  return '候補として記録';
+}
+
+function renderWeeklyHtml({ weekStart, dates, posts, stats, anniversaries, assignmentNote, recorded, weekReview }) {
+  const reviewRows = posts.filter(p => !p.locked && !p.failed).map(p => `
+      <tr>
+        <td><a href="#d-${p.date}">${esc(formatDateJa(p.date))}</a></td>
+        <td>${esc(p.opening)}</td>
+        <td>${esc(p.lastSentence)}</td>
+        <td style="white-space:nowrap">${esc(p.signature)}</td>
+        <td>${esc(p.focus)}</td>
+        <td class="${p.similarity?.length ? 'ng' : 'ok'}">${p.similarity?.length ? `⚠ ${p.similarity.map(esc).join('<br>⚠ ')}` : '✓'}${p.rewrittenFor ? '<br><span class="meta">似すぎていたため書き直し済み</span>' : ''}</td>
+      </tr>`).join('');
   const generatedAt = new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
-  const paramRows = Object.entries(draftPostParams(draft.message, productUrl))
-    .map(([k, v]) => `<tr><th>${esc(k)}</th><td class="pre">${esc(v)}</td></tr>`).join('');
-  const messageHtml = esc(draft.message).replace(esc(productUrl), `<a href="${esc(productUrl)}" target="_blank" rel="noopener">${esc(productUrl)}</a>`);
-  const images = product.images.slice(0, CONFIG.MAX_IMAGES);
-  const photos = images.length
-    ? `<div class="photos n${images.length}">${images.map(src => `<img src="${esc(src)}" alt="${esc(product.title)}">`).join('')}</div>`
-    : '<div class="noimg">画像なし</div>';
-  const rangeOk = draft.bodyChars >= CONFIG.BODY_MIN_CHARS && draft.bodyChars <= CONFIG.BODY_MAX_CHARS;
+  const rows = posts.map(p => `
+      <tr>
+        <td><a href="#d-${p.date}">${esc(formatDateJa(p.date))}</a></td>
+        <td>${esc(slotTitle(p))}</td>
+        <td>${esc(slotAnniversary(p))}</td>
+        <td class="${p.failed || p.needsReview ? 'ng' : 'ok'}">${esc(slotStatus(p))}</td>
+      </tr>`).join('');
+  const excludedRows = Object.entries({
+    soldOut: '売り切れ', noImage: '画像なし', shortDescription: `説明文が${CONFIG.MIN_DESCRIPTION_CHARS}文字未満`,
+    recentlyUsed: `前後${CONFIG.REUSE_BLOCK_DAYS}日以内に選定済み`
+  }).map(([k, label]) => `<li>${esc(label)}: ${stats.excluded[k].length}件${stats.excluded[k].length ? `<span class="meta">(${esc(stats.excluded[k].slice(0, 10).join('、'))}${stats.excluded[k].length > 10 ? ' ほか' : ''})</span>` : ''}</li>`).join('');
+  const sourceErrors = Object.entries(stats.errors).filter(([, e]) => e)
+    .map(([k, e]) => `<li class="ng">${esc(SOURCE_LABELS[k])}の取得に失敗: ${esc(e)}</li>`).join('');
+  const verifyFailures = (stats.verifyFailures || []).map(f => `<li>${esc(f.title)}<span class="meta">(${esc(f.checks.filter(c => !c.ok).map(c => `${c.label}: ${c.detail}`).join(' / '))})</span></li>`).join('');
+
   return `<!doctype html>
 <html lang="ja">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Facebook投稿プレビュー</title>
+<title>${IS_MOCK ? `【${MOCK_LABEL}】` : ''}週次投稿案プレビュー</title>
 <style>
-  :root { --bg:#f0f2f5; --card:#fff; --text:#050505; --sub:#65676b; --line:#ced0d4; --link:#f0f2f5; --warn:#fff4e5; --warn-line:#f0b45a; }
+  :root { --bg:#f0f2f5; --card:#fff; --text:#050505; --sub:#65676b; --line:#ced0d4; --soft:#f0f2f5; --warn:#fff4e5; --warn-line:#f0b45a; --ok:#2e7d32; --ng:#c62828; --accent:#1877f2; }
   @media (prefers-color-scheme: dark) {
-    :root { --bg:#18191a; --card:#242526; --text:#e4e6eb; --sub:#b0b3b8; --line:#3e4042; --link:#3a3b3c; --warn:#3a2d17; --warn-line:#a87b2f; }
+    :root { --bg:#18191a; --card:#242526; --text:#e4e6eb; --sub:#b0b3b8; --line:#3e4042; --soft:#3a3b3c; --warn:#3a2d17; --warn-line:#a87b2f; --ok:#81c784; --ng:#ef9a9a; --accent:#4599ff; }
   }
   * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--text); font-family: system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Yu Gothic UI", sans-serif; }
-  main { max-width:560px; margin:0 auto; padding:16px; }
-  a { color:#1877f2; }
-  .notice { background:var(--warn); border:1px solid var(--warn-line); border-radius:8px; padding:10px 12px; font-size:14px; margin-bottom:16px; }
-  .post { background:var(--card); border-radius:8px; box-shadow:0 1px 2px rgba(0,0,0,.2); overflow:hidden; }
-  .head { display:flex; gap:8px; align-items:center; padding:12px 16px 0; }
-  .avatar { width:40px; height:40px; border-radius:50%; background:#1877f2; color:#fff; display:grid; place-items:center; font-weight:700; }
-  .name { font-weight:600; font-size:15px; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family: system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Yu Gothic UI", sans-serif; line-height:1.5; }
+  main { max-width:760px; margin:0 auto; padding:16px; }
+  a { color:var(--accent); }
+  h1 { font-size:20px; margin:8px 0 4px; }
+  h2 { font-size:17px; margin:0; }
+  h3 { font-size:14px; margin:16px 0 6px; color:var(--sub); }
   .meta { color:var(--sub); font-size:13px; }
-  .message { padding:12px 16px; white-space:pre-wrap; font-size:15px; line-height:1.4; overflow-wrap:anywhere; }
+  .notice { background:var(--warn); border:1px solid var(--warn-line); border-radius:8px; padding:10px 12px; font-size:14px; margin:12px 0 16px; }
+  .panel { background:var(--card); border-radius:8px; box-shadow:0 1px 2px rgba(0,0,0,.2); padding:12px 16px; margin-bottom:16px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; vertical-align:top; padding:6px 8px; border-bottom:1px solid var(--line); overflow-wrap:anywhere; }
+  th { color:var(--sub); font-weight:500; }
+  .kv th { width:32%; }
+  .ok { color:var(--ok); } .ng { color:var(--ng); font-weight:600; }
+  .badges { display:flex; flex-wrap:wrap; gap:6px; margin:6px 0 10px; }
+  .badge { font-size:12px; padding:2px 8px; border-radius:999px; background:var(--soft); color:var(--sub); }
+  .badge.ng { background:transparent; border:1px solid var(--ng); }
+  .post { border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  .post .head { display:flex; gap:8px; align-items:center; padding:10px 12px 0; }
+  .avatar { width:36px; height:36px; border-radius:50%; background:#1877f2; color:#fff; display:grid; place-items:center; font-weight:700; }
+  .message { padding:10px 12px 12px; font-size:15px; line-height:1.6; overflow-wrap:anywhere; }
+  .message p { margin:0 0 .7em; }
+  .message p:last-child { margin-bottom:0; }
+  .copy-row { display:flex; align-items:center; flex-wrap:wrap; gap:8px; margin:10px 0 4px; }
+  .copy-btn { font:inherit; font-size:14px; font-weight:600; padding:8px 14px; border-radius:6px; border:1px solid var(--accent); background:var(--accent); color:#fff; cursor:pointer; }
+  .copy-btn:hover { filter:brightness(1.08); }
+  .copy-btn:focus-visible { outline:3px solid var(--warn-line); outline-offset:2px; }
+  .copy-btn.warn { background:transparent; color:var(--ng); border-color:var(--ng); }
   .photos { display:grid; gap:2px; }
-  .photos.n2 { grid-template-columns:1fr 1fr; }
-  .photos img { display:block; width:100%; aspect-ratio:1/1; object-fit:cover; background:var(--line); }
-  .photos.n1 img { aspect-ratio:auto; max-height:560px; }
-  .noimg { aspect-ratio:1.91/1; display:grid; place-items:center; color:var(--sub); background:var(--link); }
-  .ok { color:#2e7d32; } .ng { color:#c62828; font-weight:600; }
-  h2 { font-size:15px; margin:24px 0 8px; }
-  table { width:100%; border-collapse:collapse; font-size:13px; background:var(--card); border-radius:8px; overflow:hidden; }
-  th, td { text-align:left; vertical-align:top; padding:6px 10px; border-bottom:1px solid var(--line); overflow-wrap:anywhere; }
-  th { width:34%; color:var(--sub); font-weight:500; }
-  td.pre { white-space:pre-wrap; }
+  .photos.n2 { grid-template-columns:minmax(0,1fr) minmax(0,1fr); }
+  .photos img { display:block; width:100%; min-width:0; aspect-ratio:1/1; object-fit:cover; background:var(--line); }
+  .photos.n1 img { aspect-ratio:auto; max-height:480px; }
+  ul.issues { margin:6px 0; padding-left:20px; font-size:13px; }
+  details { margin-top:8px; font-size:13px; }
+  details pre { white-space:pre-wrap; background:var(--soft); padding:8px; border-radius:6px; overflow-wrap:anywhere; font-family:inherit; }
+  .mock-banner { position:sticky; top:0; z-index:10; background:#c62828; color:#fff; text-align:center; font-size:28px; font-weight:800; letter-spacing:.05em; padding:14px 12px; border-radius:0 0 8px 8px; box-shadow:0 2px 6px rgba(0,0,0,.3); }
+  .mock-banner small { display:block; font-size:13px; font-weight:500; letter-spacing:0; }
+  .mock-card { background:#c62828; color:#fff; font-size:18px; font-weight:800; text-align:center; padding:6px; border-radius:6px; margin:8px 0; }
+  .post.mock { outline:4px dashed #c62828; outline-offset:-4px; }
+  @media (max-width: 480px) { main { padding:12px 16px; } .kv th { width:40%; } .mock-banner { font-size:22px; } }
 </style>
 </head>
 <body>
+${IS_MOCK ? `<div class="mock-banner">⚠ ${MOCK_LABEL}<small>テスト用モックで作成したプレビューです。商品・URL・画像・文章はすべて架空で、実際の商品ではありません。</small></div>` : ''}
 <main>
-  <div class="notice">これはローカルのプレビューです。Facebookには何も送信していません。</div>
-  <article class="post">
-    <div class="head">
-      <div class="avatar">ふ</div>
-      <div><div class="name">ふくしま市場</div><div class="meta">プレビュー · ${esc(generatedAt)}</div></div>
-    </div>
-    <div class="message">${messageHtml}</div>
-    ${photos}
-  </article>
+  <h1>週次投稿案プレビュー</h1>
+  <div class="meta">${esc(formatDateJa(dates[0]))} 〜 ${esc(formatDateJa(dates.at(-1)))} / 作成 ${esc(generatedAt)} / データ: ${IS_MOCK ? '<b class="ng">テスト用モック</b>' : `実データ(${esc(CONFIG.SHOP_BASE_URL)})`}</div>
+  <div class="notice">これはローカルのプレビューです。Facebookには何も送信していません(公開・未公開・予約投稿のいずれも行っていません)。</div>
 
-  <h2>チェック</h2>
-  <table>
-    <tr><th>本文の文字数<br>(URL・ハッシュタグ・改行を除く)</th><td class="${rangeOk ? 'ok' : 'ng'}">${draft.bodyChars}文字(目安 ${CONFIG.BODY_MIN_CHARS}〜${CONFIG.BODY_MAX_CHARS})</td></tr>
-    <tr><th>絵文字</th><td class="${draft.emojiCount <= CONFIG.MAX_EMOJI ? 'ok' : 'ng'}">${draft.emojiCount}個(上限 ${CONFIG.MAX_EMOJI})</td></tr>
-    <tr><th>Geminiモデル</th><td>${esc(draft.model)}</td></tr>
-    <tr><th>記念日</th><td>${esc(describeAnniversary(draft))}${draft.anniversary_reason ? `<br><span class="meta">${esc(draft.anniversary_reason)}</span>` : ''}</td></tr>
-    <tr><th>注意</th><td class="${draft.warnings.length ? 'ng' : 'ok'}">${draft.warnings.length ? draft.warnings.map(esc).join('<br>') : 'なし'}</td></tr>
-  </table>
+  <section class="panel">
+    <h2>7日分の一覧</h2>
+    <table>
+      <tr><th>投稿日</th><th>商品</th><th>記念日</th><th>状態</th></tr>${rows}
+    </table>
+    <p class="meta">${recorded === null
+      ? '<span class="ng">生成に成功した投稿がないため、候補履歴は変更していません</span>'
+      : `候補履歴に記録: ${recorded}件(${esc(CONFIG.HISTORY_FILE)}、週 ${esc(weekStart)})`}${assignmentNote ? `<br><span class="ng">${esc(assignmentNote)}</span>` : ''}</p>
+  </section>
 
-  <h2>商品</h2>
-  <table>
-    <tr><th>商品</th><td>${esc(product.title)}(${esc(product.price)}円)</td></tr>
-    <tr><th>販売者</th><td>${esc(product.vendor)}</td></tr>
-    <tr><th>商品ページ</th><td><a href="${esc(productUrl)}" target="_blank" rel="noopener">${esc(productUrl)}</a></td></tr>
-    <tr><th>画像URL</th><td>${images.length ? images.map(src => `<a href="${esc(src)}" target="_blank" rel="noopener">${esc(src)}</a>`).join('<br>') : '(なし)'}</td></tr>
-    <tr><th>候補商品数</th><td>${candidateCount}件</td></tr>
-  </table>
+  <section class="panel">
+    <h2>週全体の類似チェック</h2>
+    <p class="meta">見出し・最後の一文の言い回し(商品名を除く)、文末、構成(H=見出し、数字=各段落の文の数)、切り口を7件で比べています。
+      似すぎ ${weekReview.checked}件 → 書き直し ${weekReview.rewritten.length}件 / 残り ${weekReview.remaining}件${weekReview.skipped ? `(上限を超えた${weekReview.skipped}件は書き直していません)` : ''}</p>
+    <table>
+      <tr><th>投稿日</th><th>見出し</th><th>最後の一文</th><th>構成</th><th>切り口</th><th>判定</th></tr>${reviewRows || '<tr><td colspan="6">対象なし</td></tr>'}
+    </table>
+  </section>
 
-  <h2>draft モードで送信される場合のパラメータ(今回は未送信)</h2>
-  <table>${paramRows}<tr><th>access_token</th><td>(表示しません)</td></tr></table>
-  <p class="meta">現在の draft モードはリンク投稿(画像はFacebookが商品ページから自動取得)で、上の画像1〜2枚の添付には未対応です。</p>
+  <section class="panel">
+    <h2>商品情報の取得</h2>
+    <ul class="issues">
+      <li>人気ランキング ${stats.counts.ranking}件 / 新商品 ${stats.counts.new}件 / 全商品 ${stats.counts.all}件 → 候補 ${stats.eligible}件</li>
+      ${sourceErrors}
+    </ul>
+    <h3>候補から外した商品</h3>
+    <ul class="issues">${excludedRows}</ul>
+    <h3>商品ページ・画像を確認できず使わなかった商品</h3>
+    <ul class="issues">${verifyFailures || '<li>なし</li>'}</ul>
+  </section>
+
+  ${posts.map(p => renderSlot(p, anniversaries[p.date])).join('\n')}
 </main>
+<script>${COPY_SCRIPT}</script>
 </body>
 </html>
 `;
 }
 
-function esc(value) {
-  const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
-  return String(value ?? '').replace(/[&<>"']/g, c => map[c]);
+function renderSlot(p, day) {
+  const heading = `<h2>${esc(formatDateJa(p.date))}</h2>${IS_MOCK ? `<div class="mock-card">${MOCK_LABEL}</div>` : ''}`;
+  if (p.locked) {
+    return `<section class="panel" id="d-${p.date}">${heading}
+      <div class="badges"><span class="badge">${esc(STATUS_LABELS[p.entry.status])}</span></div>
+      <p>${esc(p.entry.title)}</p>
+      <p class="meta">承認済み・公開済みの日は作り直しません。</p></section>`;
+  }
+  if (p.failed) {
+    return `<section class="panel" id="d-${p.date}">${heading}
+      <div class="badges"><span class="badge ng">失敗(履歴に記録しない)</span></div>
+      <p class="ng">${esc(p.error)}</p>${renderReplaced(p.replaced)}</section>`;
+  }
+
+  const prod = p.product;
+  const messageHtml = renderMessageHtml(p.message, prod.url);
+  const copyLabel = IS_MOCK ? '投稿文をコピー(テスト用・投稿不可)' : p.needsReview ? '投稿文をコピー(要確認)' : '投稿文をコピー';
+  const photos = prod.images.length
+    ? `<div class="photos n${prod.images.length}">${prod.images.map(src => `<img src="${esc(src)}" alt="${esc(prod.title)}" loading="lazy">`).join('')}</div>`
+    : '';
+  const sources = prod.sources.map(s => s === 'ranking' && prod.rank ? `人気ランキング${prod.rank}位` : SOURCE_LABELS[s]);
+  const anniversaryHtml = p.anniversaryUsed
+    ? `<b>${esc(p.anniversary.name)}</b>(使用)<br><span class="meta">${esc(p.anniversaryReason)}</span><br><span class="meta">${esc(p.anniversary.description)}</span>`
+    : `${p.anniversary ? `${esc(p.anniversary.name)}(関連が弱いため不使用)` : '使用しない'}${p.anniversaryReason ? `<br><span class="meta">${esc(p.anniversaryReason)}</span>` : ''}`;
+  const dayInfo = day?.ok
+    ? `<span class="meta">この日の記念日 ${day.items.length}件: ${esc(day.items.slice(0, 12).map(i => i.name).join('、'))}${day.items.length > 12 ? ' ほか' : ''}</span>`
+    : `<span class="meta">記念日情報を取得できませんでした(${esc(day?.error || '不明')})</span>`;
+  const claimRows = p.claims.map(c => `<tr><td>${esc(c.text)}</td><td>${esc(c.evidence)}</td><td class="${c.found ? 'ok' : 'ng'}">${c.found ? '✓ 一致' : '✗ 見つからない'}</td></tr>`).join('');
+  const problems = [
+    ...p.factIssues.map(i => ['ng', `事実確認: ${i}`]),
+    ...p.issues.map(i => ['ng', i]),
+    ...(p.styleIssues || []).map(i => ['ng', `言い回し: ${i}`]),
+    ...(p.similarity || []).map(i => ['ng', `類似: ${i}`]),
+    ...(p.rewrittenFor ? [['meta', `週全体の類似チェックで書き直し済み(${p.rewrittenFor.join(' / ')})`]] : []),
+    ...p.notes.map(i => ['meta', i])
+  ];
+
+  return `<section class="panel" id="d-${p.date}">
+    ${heading}
+    <div class="badges">
+      ${sources.map(s => `<span class="badge">${esc(s)}</span>`).join('')}
+      <span class="badge${prod.availability === 'unknown' ? ' ng' : ''}">${esc(AVAILABILITY_LABELS[prod.availability])}</span>
+      <span class="badge${p.needsReview ? ' ng' : ''}">${p.needsReview ? '要確認(履歴に記録しない)' : '候補として記録'}</span>
+    </div>
+    <div class="post${IS_MOCK ? ' mock' : ''}">
+      <div class="head"><div class="avatar">ふ</div><div><b>ふくしま市場</b><div class="meta">${esc(formatDateJa(p.date))} 投稿予定</div></div></div>
+      <div class="message">${messageHtml}</div>
+      ${photos}
+    </div>
+    <div class="copy-row">
+      <button type="button" class="copy-btn${p.needsReview || IS_MOCK ? ' warn' : ''}">${esc(copyLabel)}</button>
+      <span class="copy-status meta" role="status" aria-live="polite"></span>
+      <textarea class="copy-src" readonly hidden>${esc(p.message)}</textarea>
+    </div>
+
+    <h3>チェック</h3>
+    <table class="kv">
+      <tr><th>商品</th><td>${esc(prod.title)}(${esc(prod.price)}円)<br><a href="${esc(prod.url)}" target="_blank" rel="noopener">${esc(prod.url)}</a></td></tr>
+      <tr><th>本文の文字数</th><td class="${p.bodyChars > CONFIG.BODY_MAX_CHARS ? 'ng' : 'ok'}">${p.bodyChars}文字(目安 ${CONFIG.BODY_MIN_CHARS}〜${CONFIG.BODY_MAX_CHARS}、改行・URL・ハッシュタグを除く)</td></tr>
+      <tr><th>ハッシュタグ</th><td class="${p.hashtags.length === CONFIG.FIXED_HASHTAGS.length + CONFIG.EXTRA_HASHTAGS ? 'ok' : 'ng'}">${p.hashtags.length}個: ${esc(p.hashtags.join(' '))}</td></tr>
+      <tr><th>絵文字</th><td class="${p.emojiCount <= CONFIG.MAX_EMOJI ? 'ok' : 'ng'}">${p.emojiCount}個</td></tr>
+      <tr><th>記念日</th><td>${anniversaryHtml}<br>${dayInfo}</td></tr>
+      <tr><th>Gemini</th><td>${esc(p.model)} / ${p.attempts}回目で作成</td></tr>
+      <tr><th>商品ページ・画像の確認</th><td><ul class="issues">${(prod.verification || []).map(c => `<li class="${c.ok ? 'ok' : 'ng'}">${c.ok ? '✓' : '✗'} ${esc(c.label)}: ${esc(c.detail)}</li>`).join('')}</ul></td></tr>
+      <tr><th>警告</th><td>${problems.length ? `<ul class="issues">${problems.map(([cls, t]) => `<li class="${cls}">${esc(t)}</li>`).join('')}</ul>` : '<span class="ok">なし</span>'}</td></tr>
+    </table>
+    ${renderReplaced(p.replaced)}
+
+    <h3>根拠(本文の記述 → 商品情報からの引用)</h3>
+    <table>
+      <tr><th>本文の記述</th><th>引用</th><th>照合</th></tr>
+      ${claimRows || '<tr><td colspan="3" class="ng">引用がありません</td></tr>'}
+    </table>
+    <details><summary>商品説明の全文(根拠の確認用)</summary><pre>${esc(prod.description)}</pre></details>
+  </section>`;
 }
 
 /**
- * draft の実行には、FB_DRAFT_APPROVAL にページIDを明示的に入れる必要がある。
- * 入力ミスや既定値で下書きが作られないよう、対象ページも APPROVED_PAGE_ID に固定する。
+ * 投稿文の表示。空行で区切られたまとまりを段落(<p>)にし、段落内の改行は <br> にする。
+ * 余白は段落の間だけに付くので、コピーされる文章(空行=段落の区切り)と見た目が一致する。
  */
-function assertDraftApproved() {
-  const pageId = requireEnv('FB_PAGE_ID');
-  if (pageId !== CONFIG.APPROVED_PAGE_ID) {
-    throw new Error(`FB_PAGE_ID が許可されたページ(${CONFIG.APPROVED_PAGE_ID})と一致しないため、何も送信せずに中止しました。`);
-  }
-  if (process.env.FB_DRAFT_APPROVAL !== CONFIG.APPROVED_PAGE_ID) {
-    throw new Error(`draft の実行には承認が必要です。FB_DRAFT_APPROVAL に ${CONFIG.APPROVED_PAGE_ID} を指定してください。何も送信せずに中止しました。`);
-  }
+function renderMessageHtml(message, url) {
+  const link = `<a href="${esc(url)}" target="_blank" rel="noopener">${esc(url)}</a>`;
+  return message.split('\n\n')
+    .map(block => `<p>${block.split('\n').map(line => (line === url ? link : esc(line))).join('<br>')}</p>`)
+    .join('');
 }
 
-/**
- * Facebook への通信はすべてここを通す。
- * - preview: すべて遮断
- * - check: 読み取り(GET)のみ
- * - draft: GET と、承認済みページの /feed への下書き POST のみ
- */
-async function guardedFacebookFetch(url, init = {}) {
-  const method = (init.method || 'GET').toUpperCase();
-  if (MODE === 'preview' || MODE === 'models') {
-    throw new Error(`${MODE} モードではFacebookへの通信は禁止されています。`);
-  }
-  if (method === 'GET') return fetch(url, init);
-
-  const feedUrl = `https://graph.facebook.com/${CONFIG.GRAPH_API_VERSION}/${CONFIG.APPROVED_PAGE_ID}/feed`;
-  if (MODE !== 'draft' || method !== 'POST' || url !== feedUrl) {
-    throw new Error(`許可されていないFacebookへの書き込みを遮断しました: ${method} ${url}`);
-  }
-  assertDraftApproved();
-  assertDraftOnlyParams(init.body);
-  return fetch(url, init);
-}
-
-/**
- * 下書き保存以外のパラメータ(公開・予約など)が含まれていたら送信しない。
- */
-function assertDraftOnlyParams(body) {
-  if (!(body instanceof URLSearchParams)) throw new Error('下書きの送信パラメータの形式が不正です。');
-  const allowed = new Set(['message', 'link', 'published', 'unpublished_content_type', 'access_token']);
-  for (const key of new Set(body.keys())) {
-    if (!allowed.has(key)) throw new Error(`許可されていないパラメータ "${key}" が含まれるため送信を中止しました。`);
-    if (body.getAll(key).length !== 1) throw new Error(`パラメータ "${key}" が重複しているため送信を中止しました。`);
-  }
-  if (body.get('published') !== 'false') {
-    throw new Error('published=false でないため送信を中止しました(公開投稿の防止)。');
-  }
-  if (body.get('unpublished_content_type') !== 'DRAFT') {
-    throw new Error('unpublished_content_type=DRAFT でないため送信を中止しました(予約投稿などの防止)。');
-  }
-}
-
-/**
- * トークンの有効期限が近いときに警告を出す。
- * 残り TOKEN_WARN_DAYS 日を切ったら GITHUB_OUTPUT に書き出し、ワークフロー側で Issue を立てて知らせる。
- */
-async function warnIfTokenExpiresSoon(token) {
-  let data;
+/** 「投稿文をコピー」ボタン。隠しテキストエリアの文章をそのまま(改行も含めて)コピーする */
+const COPY_SCRIPT = `
+document.addEventListener('click', async e => {
+  const btn = e.target.closest('.copy-btn');
+  if (!btn) return;
+  const row = btn.closest('.copy-row');
+  const text = row.querySelector('.copy-src').value;
+  const status = row.querySelector('.copy-status');
+  let ok = false;
   try {
-    data = (await graphGet(`debug_token?input_token=${encodeURIComponent(token)}`, token)).data;
-  } catch (e) {
-    log('トークンの有効期限を確認できませんでした: ' + e.message);
-    return;
+    await navigator.clipboard.writeText(text);
+    ok = true;
+  } catch (_) {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { ok = document.execCommand('copy'); } catch (_) { ok = false; }
+    ta.remove();
   }
-  if (!data || !data.expires_at) return; // 0 = 無期限
-  const daysLeft = Math.floor((data.expires_at * 1000 - Date.now()) / (24 * 60 * 60 * 1000));
-  const expiresText = new Date(data.expires_at * 1000).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
-  log(`トークンの有効期限: ${expiresText}(残り${daysLeft}日)`);
-  if (daysLeft <= CONFIG.TOKEN_WARN_DAYS) {
-    console.log(`::warning::Facebookトークンの有効期限が近づいています: ${expiresText}(残り${daysLeft}日)`);
-    if (process.env.GITHUB_OUTPUT) {
-      appendFileSync(process.env.GITHUB_OUTPUT, `token_expires=${expiresText}\ntoken_days_left=${daysLeft}\n`);
-    }
-  }
-}
-
-/**
- * ページ名を取得してトークンの有効性を確認する。
- * システムユーザーのトークンが渡された場合は、ページアクセストークンに交換する。
- */
-async function resolvePage(pageId, token) {
-  const json = await graphGet(`${pageId}?fields=name,access_token`, token);
-  return { name: json.name, accessToken: json.access_token || token };
-}
-
-async function collectCandidateProducts() {
-  const byId = new Map();
-  for (const path of CONFIG.PRODUCT_SOURCE_PATHS) {
-    for (const p of await fetchShopifyProducts(path)) byId.set(p.id, p);
-  }
-  if (byId.size === 0) {
-    for (const p of await fetchShopifyProducts(CONFIG.PRODUCT_FALLBACK_PATH)) byId.set(p.id, p);
-  }
-
-  const all = [...byId.values()];
-  const posted = getPostedProductHandles();
-  let candidates = all.filter(p => !posted.has(p.handle));
-
-  if (candidates.length === 0) {
-    // ranking_top10 / new-1 が軒並み紹介済みの場合は、カタログ全体まで候補を広げる
-    const fallback = (await fetchShopifyProducts(CONFIG.PRODUCT_FALLBACK_PATH))
-      .filter(p => !posted.has(p.handle));
-    candidates = fallback.length > 0 ? fallback : all; // それでも無ければ重複を許容する
-  }
-  return candidates.slice(0, CONFIG.MAX_CANDIDATE_PRODUCTS);
-}
-
-async function fetchShopifyProducts(path) {
-  try {
-    const res = await fetch(CONFIG.SHOP_BASE_URL + path);
-    if (!res.ok) return [];
-    const json = await res.json();
-    return (json.products || [])
-      .filter(p => p.variants && p.variants.length > 0 && p.handle)
-      .map(p => ({
-        id: p.id,
-        title: p.title,
-        handle: p.handle,
-        vendor: p.vendor,
-        productType: p.product_type,
-        tags: Array.isArray(p.tags) ? p.tags.join(', ') : p.tags,
-        price: p.variants[0].price,
-        description: htmlToText(p.body_html).slice(0, 300),
-        images: (p.images || []).map(img => img.src).filter(Boolean).slice(0, CONFIG.MAX_IMAGES)
-      }));
-  } catch {
-    return [];
-  }
-}
-
-function htmlToText(html) {
-  return String(html || '')
-    .replace(/<(script|style)[\s\S]*?<\/\1>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function loadHistory() {
-  if (!existsSync(CONFIG.HISTORY_FILE)) return [];
-  try {
-    return JSON.parse(readFileSync(CONFIG.HISTORY_FILE, 'utf8'));
-  } catch {
-    return [];
-  }
-}
-
-function getPostedProductHandles() {
-  const cutoff = Date.now() - CONFIG.HISTORY_RETENTION_DAYS * 24 * 60 * 60 * 1000;
-  return new Set(loadHistory().filter(e => e.postedAt >= cutoff).map(e => e.handle));
-}
-
-function getRecentOpenings() {
-  return loadHistory().map(e => e.opening).filter(Boolean).slice(-CONFIG.RECENT_OPENINGS_COUNT);
-}
-
-function recordProductAsPosted(handle, opening) {
-  const cutoff = Date.now() - CONFIG.HISTORY_RETENTION_DAYS * 24 * 60 * 60 * 1000;
-  const history = loadHistory().filter(e => e.postedAt >= cutoff);
-  history.push({ handle, opening, postedAt: Date.now() });
-  writeFileSync(CONFIG.HISTORY_FILE, JSON.stringify(history.slice(-CONFIG.HISTORY_MAX_ENTRIES), null, 2) + '\n');
-}
-
-async function generateDraftWithGemini(products) {
-  const apiKey = requireEnv('GEMINI_API_KEY');
-  const dateText = new Intl.DateTimeFormat('ja-JP', {
-    timeZone: 'Asia/Tokyo', year: 'numeric', month: 'long', day: 'numeric', weekday: 'short'
-  }).format(new Date());
-
-  const productListText = products.map(p =>
-    `- タイトル: ${p.title} / 価格: ${p.price}円 / 販売者(生産者): ${p.vendor} / 種別: ${p.productType} / タグ: ${p.tags} / handle: ${p.handle}\n  説明: ${p.description || '(なし)'}`
-  ).join('\n');
-  const examples = loadStyleExamples();
-  const recentOpenings = getRecentOpenings();
-
-  const prompt = `
-あなたは「ふくしま市場」(福島県産品のオンラインストア、https://fukushima-ichiba.com/)の
-SNS担当者です。公式Xアカウント(@fukushima_18)の投稿のような、シンプルで読みやすい
-Facebook投稿の本文を書いてください。
-
-今日の日付: ${dateText}
-
-手順:
-1. 下記の商品候補リストから紹介する商品を1つ選ぶ。リストに無い商品は絶対に登場させない。
-2. 今日が記念日・行事の日で、選んだ商品と自然な関連がある場合だけ、それを導入に使う。
-   - 広く知られていて確信が持てる記念日だけを使う
-   - 関連が弱い・こじつけになる場合は使わず、通常の商品紹介にする(無理に結びつけない)
-   - 使う場合も、記念日の説明は短く一言で済ませる
-3. 本文を書く。
-
-本文の構成:
-1行目: 商品や記念日に関する短い導入
-続けて2〜4行: 商品名・産地・生産者・特徴を簡潔に、魅力は具体的に(味・食感・食べ方・量など)
-
-本文のルール:
-- 日本語。改行・URL・ハッシュタグを除いて${CONFIG.BODY_MIN_CHARS}〜${CONFIG.BODY_MAX_CHARS}文字
-- 絵文字は0〜${CONFIG.MAX_EMOJI}個
-- 誇張表現や不自然な宣伝文句(「最高」「絶品」「今だけ」「お見逃しなく」など)は使わない
-- 商品名・産地・生産者など、リストに無い情報を捏造しない(分からない項目は書かない)
-- 「▼詳細はこちら」、URL、ハッシュタグは本文に入れない(後から自動で付ける)
-- 毎回同じ言い回しにならないよう、書き出しや文の組み立てを変える
-${recentOpenings.length ? `- 最近の投稿の書き出しは次のとおり。これらと似た書き出しは避ける:\n${recentOpenings.map(o => `  ・${o}`).join('\n')}` : ''}
-${examples.length ? `\n公式Xの投稿例(雰囲気の参考。文章をそのまま流用しない):\n${examples.map(e => `---\n${e}`).join('\n')}\n---\n` : ''}
-出力は次のJSON形式のみ。前後に説明文やコードブロック記号は一切つけないこと。
-{"anniversary": "検討した今日の記念日(無ければ空文字)", "anniversary_used": true または false, "anniversary_reason": "使った/使わなかった理由を一言", "product_handle": "選んだ商品のhandle", "body": "本文"}
-
-商品候補リスト:
-${productListText}
+  status.textContent = ok ? 'コピーしました' : 'コピーできませんでした。文章を選択してコピーしてください';
+  clearTimeout(btn._timer);
+  btn._timer = setTimeout(() => { status.textContent = ''; }, 2500);
+});
 `;
 
-  let draft;
-  let feedback = '';
-  for (let attempt = 1; attempt <= CONFIG.GEMINI_MAX_ATTEMPTS; attempt++) {
-    draft = await callGemini(apiKey, prompt + feedback);
-    draft.body = cleanBody(draft.body);
-    draft.bodyChars = countBodyChars(draft.body);
-    draft.emojiCount = countEmoji(draft.body);
-    draft.opening = draft.body.split('\n')[0].slice(0, 40);
-    draft.warnings = checkBodyRules(draft);
-    if (draft.warnings.length === 0) break;
-    log(`投稿文がルールを外れたため作り直します(${attempt}回目): ${draft.warnings.join(' / ')}`);
-    feedback = `\n\n前回の本文は次の点がルール違反でした。直して書き直してください: ${draft.warnings.join(' / ')}\n前回の本文:\n${draft.body}\n`;
-  }
-  return draft;
+function renderReplaced(replaced) {
+  if (!replaced || replaced.length === 0) return '';
+  return `<p class="meta">差し替えた商品: ${replaced.map(r => `${esc(r.title)}(${esc(r.reason)})`).join('、')}</p>`;
 }
+
+// ---------------------------------------------------------------------------
+// 外部サイトへのアクセス
+// ---------------------------------------------------------------------------
+
+const lastRequestAt = new Map();
+
+/**
+ * 商品サイト・雑学ネタ帳・商品画像の配信サーバーだけに使う(読み取りのみ: GET / HEAD)。
+ * 同じサイトへは間隔を空け、429/503 のときは待って再試行する(retry: false なら再試行しない)。
+ */
+async function politeFetch(url, { method = 'GET', retry = true } = {}) {
+  const host = new URL(url).host;
+  const allowed = [new URL(CONFIG.SHOP_BASE_URL).host, new URL(CONFIG.ZATSUNETA_BASE_URL).host, ...IMAGE_HOSTS];
+  if (!allowed.includes(host)) throw new Error(`許可されていない宛先です: ${host}`);
+  if (!['GET', 'HEAD'].includes(method)) throw new Error(`読み取り以外のアクセスはしません: ${method}`);
+  for (let attempt = 0; ; attempt++) {
+    const wait = (lastRequestAt.get(host) || 0) + CONFIG.REQUEST_INTERVAL_MS - Date.now();
+    if (wait > 0) await sleep(wait);
+    lastRequestAt.set(host, Date.now());
+    const res = await fetch(url, { method, headers: { 'User-Agent': CONFIG.USER_AGENT } });
+    if (retry && (res.status === 429 || res.status === 503) && attempt < CONFIG.MAX_FETCH_RETRIES) {
+      const retryAfter = Number(res.headers?.get?.('retry-after'));
+      const ms = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : CONFIG.RETRY_WAIT_MS * (attempt + 1);
+      log(`${host} がアクセス制限中(HTTP ${res.status})のため ${Math.round(ms / 1000)} 秒待って再試行します`);
+      await sleep(ms);
+      continue;
+    }
+    return res;
+  }
+}
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+// ---------------------------------------------------------------------------
+// models / check
+// ---------------------------------------------------------------------------
 
 /**
  * Gemini APIのモデル一覧からFlash系を抜き出し、それぞれ短い generateContent を1回呼んで
  * 実際に使えるかを確かめる(一覧に載っていても新規キーでは使えないモデルがあるため)。
- * APIキーはヘッダーでのみ送り、ログには出さない。
  */
 async function checkGeminiModels() {
   const apiKey = requireEnv('GEMINI_API_KEY');
@@ -539,101 +1538,56 @@ async function checkGeminiModels() {
   ].join('\n'));
 }
 
-/**
- * GEMINI_MODELS を先頭から試す。混雑(503)や上限(429)のときだけ次のモデルに切り替え、
- * それ以外のエラーはそのまま止める。
- */
-async function callGemini(apiKey, prompt) {
-  let json;
-  let model;
-  for (model of CONFIG.GEMINI_MODELS) {
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { responseMimeType: 'application/json', temperature: 1.0 }
-      })
-    });
-    json = await res.json();
-    const transient = json.error && ['UNAVAILABLE', 'RESOURCE_EXHAUSTED'].includes(json.error.status);
-    if (!transient) break;
-    log(`Gemini ${model} が一時的に使えないため次のモデルを試します: ${json.error.code} ${json.error.status}`);
-  }
-  if (json.error) throw new Error(`Gemini APIエラー(${model}): ` + JSON.stringify(json.error));
+async function runCheck() {
+  const token = requireEnv('FB_PAGE_ACCESS_TOKEN');
+  // FB_PAGE_ID が未登録・誤りでも、登録すべきページIDが分かるようにする
+  await warnIfTokenExpiresSoon(token);
+  const me = await graphGet('me?fields=name,id', token);
+  const pages = (await graphGet('me/accounts?fields=name,id', token)).data || [];
+  summary([
+    `### トークンの持ち主: ${me.name}`,
+    `このトークンで扱えるページ(${pages.length}件):`,
+    ...pages.map(p => `- ${p.name}: ${p.id}${p.id === process.env.FB_PAGE_ID ? ' ← FB_PAGE_ID と一致' : ''}`)
+  ].join('\n'));
+  if (!process.env.FB_PAGE_ID) return;
+  const pageId = process.env.FB_PAGE_ID;
+  const page = await graphGet(`${pageId}?fields=name`, token);
+  summary(`### トークン確認OK\n- ページ: ${page.name} (${pageId})`);
+}
 
-  const rawText = json.candidates?.[0]?.content?.parts?.[0]?.text || '';
-  const cleaned = rawText.trim().replace(/^```(json)?/i, '').replace(/```$/, '').trim();
-  let draft;
+/**
+ * トークンの有効期限が近いときに警告を出す。
+ * 残り TOKEN_WARN_DAYS 日を切ったら GITHUB_OUTPUT に書き出し、ワークフロー側で Issue を立てて知らせる。
+ */
+async function warnIfTokenExpiresSoon(token) {
+  let data;
   try {
-    draft = JSON.parse(cleaned);
-  } catch {
-    throw new Error('Geminiの出力をJSONとして解析できませんでした: ' + rawText);
+    data = (await graphGet(`debug_token?input_token=${encodeURIComponent(token)}`, token)).data;
+  } catch (e) {
+    log('トークンの有効期限を確認できませんでした: ' + e.message);
+    return;
   }
-  if (!draft.body || !draft.product_handle) {
-    throw new Error('Geminiの出力に必要な項目(body / product_handle)がありません: ' + rawText);
+  if (!data || !data.expires_at) return; // 0 = 無期限
+  const daysLeft = Math.floor((data.expires_at * 1000 - Date.now()) / (24 * 60 * 60 * 1000));
+  const expiresText = new Date(data.expires_at * 1000).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
+  log(`トークンの有効期限: ${expiresText}(残り${daysLeft}日)`);
+  if (daysLeft <= CONFIG.TOKEN_WARN_DAYS) {
+    console.log(`::warning::Facebookトークンの有効期限が近づいています: ${expiresText}(残り${daysLeft}日)`);
+    if (process.env.GITHUB_OUTPUT) {
+      appendFileSync(process.env.GITHUB_OUTPUT, `token_expires=${expiresText}\ntoken_days_left=${daysLeft}\n`);
+    }
   }
-  draft.model = model;
-  return draft;
-}
-
-/** 本文に紛れ込んだ URL・ハッシュタグ・「▼詳細はこちら」を取り除く(後でコード側が付ける)。 */
-function cleanBody(body) {
-  return String(body)
-    .replace(/https?:\/\/\S+/g, '')
-    .replace(/▼?\s*詳細はこちら/g, '')
-    .replace(/(^|\s)#[^\s#]+/g, '$1')
-    .split('\n').map(line => line.trim()).join('\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
-
-function countBodyChars(body) {
-  return [...body.replace(/\s/g, '')].length;
-}
-
-function countEmoji(text) {
-  return (text.match(/\p{Extended_Pictographic}/gu) || []).length;
-}
-
-function checkBodyRules(draft) {
-  const warnings = [];
-  if (draft.bodyChars < CONFIG.BODY_MIN_CHARS || draft.bodyChars > CONFIG.BODY_MAX_CHARS) {
-    warnings.push(`本文が${draft.bodyChars}文字(目安 ${CONFIG.BODY_MIN_CHARS}〜${CONFIG.BODY_MAX_CHARS}文字)`);
-  }
-  if (draft.emojiCount > CONFIG.MAX_EMOJI) {
-    warnings.push(`絵文字が${draft.emojiCount}個(上限 ${CONFIG.MAX_EMOJI}個)`);
-  }
-  const ng = CONFIG.NG_PHRASES.filter(p => draft.body.includes(p));
-  if (ng.length) warnings.push(`誇張・宣伝的な表現: ${ng.join('、')}`);
-  return warnings;
-}
-
-function loadStyleExamples() {
-  if (!existsSync(CONFIG.STYLE_EXAMPLES_FILE)) return [];
-  return readFileSync(CONFIG.STYLE_EXAMPLES_FILE, 'utf8')
-    .split(/^---\s*$/m)
-    .map(s => s.trim())
-    .filter(Boolean);
 }
 
 /**
- * Facebookページに下書き投稿を作成する(公開はしない)。
- * 送信前に guardedFacebookFetch が承認とパラメータを検査する。
+ * Facebook への通信はすべてここを通す。check の読み取り(GET)以外は遮断する。
+ * 下書き保存(POST)の経路は、週次版が完成するまで持たない。
  */
-async function createDraftPost(pageId, pageToken, message, link) {
-  const body = new URLSearchParams({ ...draftPostParams(message, link), access_token: pageToken });
-  const res = await guardedFacebookFetch(`https://graph.facebook.com/${CONFIG.GRAPH_API_VERSION}/${pageId}/feed`, {
-    method: 'POST',
-    body
-  });
-  const json = await res.json();
-  if (json.error) throw new Error('Facebook Graph APIエラー: ' + describeGraphError(json.error));
-  return json.id;
-}
-
-function draftPostParams(message, link) {
-  return { message, link, published: 'false', unpublished_content_type: 'DRAFT' };
+async function guardedFacebookFetch(url, init = {}) {
+  const method = (init.method || 'GET').toUpperCase();
+  if (MODE !== 'check') throw new Error(`${MODE} モードではFacebookへの通信は禁止されています。`);
+  if (method !== 'GET') throw new Error(`Facebookへの書き込みは停止中のため遮断しました: ${method} ${url}`);
+  return fetch(url, init);
 }
 
 async function graphGet(path, token) {
@@ -653,6 +1607,75 @@ function describeGraphError(error) {
   };
   const hint = hints[error.code] ? `\n→ ${hints[error.code]}` : '';
   return `${JSON.stringify(error)}${hint}`;
+}
+
+// ---------------------------------------------------------------------------
+// 共通
+// ---------------------------------------------------------------------------
+
+function todayJst() {
+  return new Date(Date.now() + 9 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
+function addDays(ymd, n) {
+  const d = new Date(`${ymd}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+
+/** 翌週の月曜日(今日が月曜なら7日後) */
+function nextMondayJst() {
+  const today = todayJst();
+  const dow = new Date(`${today}T00:00:00Z`).getUTCDay();
+  return addDays(today, ((8 - dow) % 7) || 7);
+}
+
+function weekdayJa(ymd) {
+  return '日月火水木金土'[new Date(`${ymd}T00:00:00Z`).getUTCDay()];
+}
+
+function formatDateJa(ymd) {
+  const [, m, d] = ymd.split('-').map(Number);
+  return `${m}月${d}日(${weekdayJa(ymd)})`;
+}
+
+function htmlToText(html) {
+  return decodeEntities(String(html || '')
+    .replace(/<(script|style)[\s\S]*?<\/\1>/gi, ' ')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/(p|div|li|h[1-6]|tr)>/gi, '\n')
+    .replace(/<[^>]+>/g, ' '))
+    .split('\n').map(compactSpaces).filter(Boolean).join('\n');
+}
+
+function decodeEntities(s) {
+  return String(s)
+    .replace(/&nbsp;/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#0?39;/g, "'")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
+    .replace(/&amp;/g, '&');
+}
+
+function compactSpaces(s) {
+  return String(s).replace(/[ \t　]+/g, ' ').trim();
+}
+
+/** 空白を除いた文字列(説明文の長さの判定用) */
+function compact(s) {
+  return String(s || '').replace(/\s/g, '');
+}
+
+/** 照合用: 全角・半角をそろえ、空白を除く */
+function norm(s) {
+  return String(s || '').normalize('NFKC').replace(/\s/g, '').toLowerCase();
+}
+
+function esc(value) {
+  const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+  return String(value ?? '').replace(/[&<>"']/g, c => map[c]);
+}
+
+function mdCell(s) {
+  return String(s).replace(/\|/g, '\\|');
 }
 
 function requireEnv(name) {

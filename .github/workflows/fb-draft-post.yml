@@ -1,17 +1,18 @@
 name: Facebook draft post (fukushima-ichiba)
 
 # 自動実行(schedule)は行わない。手動実行のみ。
-# 既定は preview(Facebookへは一切通信しない)。
+# 既定は preview(翌週7日分の投稿案を作るだけで、Facebookへは一切通信しない)。
+# 下書き保存(draft)は週次版が完成するまで停止中。
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "preview=文面とプレビュー生成のみ(Facebook通信なし) / models=Geminiの利用可能モデル確認(Facebook通信なし) / check=トークン確認のみ(読み取り) / draft=下書き保存(承認が必要)"
+        description: "preview=翌週7日分の投稿案とプレビュー生成(Facebook通信なし) / models=Geminiの利用可能モデル確認(Facebook通信なし) / check=トークン確認のみ(読み取り)"
         type: choice
-        options: [preview, models, check, draft]
+        options: [preview, models, check]
         default: preview
-      confirm_page_id:
-        description: "draft のときだけ: 承認としてページID 277404605612561 を入力(一致しないと何も送信しない)"
+      week_start:
+        description: "preview のみ: 対象週の初日(YYYY-MM-DD)。空なら翌週の月曜日"
         type: string
         required: false
         default: ""
@@ -21,12 +22,10 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # preview / models / check: Facebookへの書き込みは行わない
-  preview-or-check:
-    if: ${{ inputs.mode != 'draft' }}
+  run:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: read # main へは自動コミットしない(履歴は Artifacts に保存する)
       issues: write # トークンの期限が近いときに Issue で知らせるため(check のみ)
     steps:
       - uses: actions/checkout@v4
@@ -39,19 +38,23 @@ jobs:
         id: post
         env:
           MODE: ${{ inputs.mode }}
-          # preview には Facebook のトークンを渡さない
+          WEEK_START: ${{ inputs.week_start }}
+          # preview / models には Facebook のトークンを渡さない
           FB_PAGE_ID: ${{ inputs.mode == 'check' && secrets.FB_PAGE_ID || '' }}
           FB_PAGE_ACCESS_TOKEN: ${{ inputs.mode == 'check' && secrets.FB_PAGE_ACCESS_TOKEN || '' }}
           GEMINI_API_KEY: ${{ (inputs.mode == 'preview' || inputs.mode == 'models') && secrets.GEMINI_API_KEY || '' }}
         run: node scripts/fb-draft-post.mjs
 
-      - name: Upload preview
-        if: ${{ inputs.mode == 'preview' }}
+      - name: Upload preview and history
+        if: ${{ inputs.mode == 'preview' && !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
-          name: fb-preview
-          path: preview/fb-preview.html
-          retention-days: 7
+          name: fb-weekly-preview
+          path: |
+            preview/*.html
+            data/fb-post-history.json
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: Notify token expiry
         if: ${{ steps.post.outputs.token_days_left != '' }}
@@ -66,60 +69,3 @@ jobs:
 
           Meta Business Suite のシステムユーザーでトークンを再生成し、
           \`gh secret set FB_PAGE_ACCESS_TOKEN\` で差し替えてください。差し替えたらこの Issue を閉じてください。"
-
-  # draft: ページIDの入力と、Environment "facebook-draft" の承認を通ったときだけ実行する
-  draft:
-    if: ${{ inputs.mode == 'draft' }}
-    runs-on: ubuntu-latest
-    environment: facebook-draft
-    permissions:
-      contents: write # 紹介済み商品の履歴ファイルをコミットするため
-      issues: write # トークンの期限が近いときに Issue で知らせるため
-    steps:
-      - name: Check approval input
-        env:
-          CONFIRM: ${{ inputs.confirm_page_id }}
-        run: |
-          if [ "$CONFIRM" != "277404605612561" ]; then
-            echo "::error::confirm_page_id が一致しないため中止しました(Facebookへは何も送信していません)。"
-            exit 1
-          fi
-
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Create Facebook draft
-        id: post
-        env:
-          MODE: draft
-          FB_DRAFT_APPROVAL: ${{ inputs.confirm_page_id }}
-          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
-          FB_PAGE_ACCESS_TOKEN: ${{ secrets.FB_PAGE_ACCESS_TOKEN }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: node scripts/fb-draft-post.mjs
-
-      - name: Notify token expiry
-        if: ${{ steps.post.outputs.token_days_left != '' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          EXPIRES: ${{ steps.post.outputs.token_expires }}
-          DAYS_LEFT: ${{ steps.post.outputs.token_days_left }}
-        run: |
-          title="Facebookトークンの有効期限が近づいています"
-          if [ -n "$(gh issue list --state open --search "in:title $title" --json number --jq '.[].number')" ]; then exit 0; fi
-          gh issue create --title "$title" --body "FB_PAGE_ACCESS_TOKEN の有効期限: ${EXPIRES}(残り${DAYS_LEFT}日)
-
-          Meta Business Suite のシステムユーザーでトークンを再生成し、
-          \`gh secret set FB_PAGE_ACCESS_TOKEN\` で差し替えてください。差し替えたらこの Issue を閉じてください。"
-
-      - name: Save posted-product history
-        run: |
-          git add data/fb-posted-history.json
-          if git diff --cached --quiet; then exit 0; fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
-          git commit -m "Update Facebook posted-product history [skip ci]"
-          git push

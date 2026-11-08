@@ -2,3 +2,4 @@ node_modules/
 .clasprc.json
 .clasp.json
 preview/
+data/*.test.json
