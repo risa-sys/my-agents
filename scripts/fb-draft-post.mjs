@@ -25,9 +25,13 @@ import { dirname, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const CONFIG = {
-  // 先頭から順に使う。2つ目以降は先頭が混雑・上限で使えないときの予備
+  // 先頭から順に使う。2つ目以降は先頭が混雑・上限・通信エラーで使えないときの予備
   // (2026-11-08 に models モードで、一覧掲載と新APIキーでの呼び出しを確認したモデル)
-  GEMINI_MODELS: process.env.GEMINI_MODEL ? [process.env.GEMINI_MODEL] : ['gemini-3.8-flash', 'gemini-3.7-flash'],
+  GEMINI_MODELS: process.env.GEMINI_MODEL ? [process.env.GEMINI_MODEL] : ['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash'],
+  GEMINI_TIMEOUT_MS: Number(process.env.GEMINI_TIMEOUT_MS ?? 60000), // 1回の呼び出しの上限時間(応答が無ければ次のモデルへ)
+  // すべてのモデルが混雑・通信エラーのとき、この時間だけ待って最初のモデルからやり直す(回数=要素数)
+  GEMINI_RETRY_WAITS_MS: String(process.env.GEMINI_RETRY_WAITS_MS ?? '30000,60000').split(',').map(Number),
+  GEMINI_OUTAGE_SLOTS: 2, // 混雑・通信エラーで生成できない日がこれだけ続いたら、残りの日は待たずに見送る
   GEMINI_MAX_ATTEMPTS: 3, // ルールを外れた本文は、理由を添えて作り直させる
   MAX_PRODUCT_SWITCHES: 2, // それでも直らないときに、予備の商品へ差し替える回数
   GRAPH_API_VERSION: 'v26.0',
@@ -41,6 +45,19 @@ const CONFIG = {
   ALL_MAX_PAGES: 4,
   MIN_DESCRIPTION_CHARS: 50, // 説明文がこれより短い商品は、根拠が足りないので候補にしない
   MAX_IMAGES: 2,
+  // ジャンルの偏りを防ぐ。同じジャンルは1週間で原則この件数まで(候補が足りないときだけ超える)
+  MAX_PER_GENRE: 2,
+  // 商品名・種別・タグの言葉でジャンルを決める(上から順に判定。例: 桃ジュース→飲料、米こうじみそ→調味料)
+  GENRE_RULES: [
+    ['飲料・お酒', ['日本酒', '純米', '吟醸', '地酒', '清酒', 'ワイン', 'ビール', '焼酎', 'リキュール', 'シードル', 'ジュース', 'サイダー', '飲料', 'コーヒー', '珈琲', '紅茶', '緑茶', 'お茶']],
+    ['お菓子・スイーツ', ['菓子', 'せんべい', '煎餅', '米菓', 'まんじゅう', '饅頭', '羊羹', 'ようかん', 'ゆべし', 'クッキー', 'ケーキ', 'チョコ', 'プリン', 'ゼリー', 'かりんとう', 'スイーツ', 'ままどおる', '最中', 'もなか']],
+    ['調味料・加工品', ['みそ', '味噌', '醤油', 'しょうゆ', 'たれ', 'タレ', 'ドレッシング', 'ジャム', '漬物', '漬け', '佃煮', '缶詰', 'の素', 'つゆ', 'ソース', '干し', '凍み', '惣菜', 'レトルト']],
+    ['麺類', ['ラーメン', 'らーめん', 'そば', '蕎麦', 'うどん', '冷麺', '麺']],
+    ['お米', ['お米', '新米', '精米', '玄米', '無洗米', 'コシヒカリ', 'ひとめぼれ', 'ミルキークイーン', '天のつぶ', '里山のつぶ', 'にじのきらめき', '五百川', '福、笑い', 'うるち米', 'もち米']],
+    ['肉・魚', ['牛肉', '豚肉', '鶏肉', '地鶏', '和牛', '牛', '豚', 'ハム', 'ソーセージ', 'ベーコン', '鮭', '鯉', 'うなぎ', '魚', '肉']],
+    ['果物', ['柿', 'りんご', '林檎', '桃', 'もも', '梨', 'ぶどう', '葡萄', 'シャインマスカット', 'いちご', '苺', 'さくらんぼ', 'メロン', 'ラ・フランス', '洋梨', 'ブルーベリー', 'フルーツ', '果物']],
+    ['野菜・農産物', ['野菜', 'トマト', 'きゅうり', 'アスパラ', 'じゃがいも', 'かぼちゃ', '自然薯', 'きのこ', 'しいたけ', 'なめこ', 'ねぎ', '大豆', '豆', 'にんにく']]
+  ],
 
   // 今日は何の日(雑学ネタ帳)
   ZATSUNETA_BASE_URL: 'https://zatsuneta.com',
@@ -50,6 +67,7 @@ const CONFIG = {
   USER_AGENT: 'fukushima-ichiba-fb-preview/1.0 (+https://fukushima-ichiba.com/)',
   REQUEST_INTERVAL_MS: Number(process.env.REQUEST_INTERVAL_MS ?? 2000), // 同じサイトへの最短間隔
   RETRY_WAIT_MS: Number(process.env.RETRY_WAIT_MS ?? 10000), // 429/503 のときの待ち時間(回数に比例して延ばす)
+  FETCH_TIMEOUT_MS: Number(process.env.FETCH_TIMEOUT_MS ?? 30000), // 商品サイト・雑学ネタ帳・画像への1回の上限時間
   MAX_FETCH_RETRIES: 3,
 
   // 商品ページ・画像の確認(読み取りのみ)
@@ -188,10 +206,17 @@ async function runWeeklyPreview() {
   const historyPhrases = recentPhrases(history, weekStart, dates);
   const avoid = { openings: [...historyPhrases.openings], closings: [...historyPhrases.closings] };
   const results = new Map();
+  let outageStreak = 0;
   for (const date of openDates) {
     const a = assignments.find(x => x.date === date);
     if (!a) {
-      results.set(date, { date, failed: true, error: '条件に合う候補商品が足りませんでした' });
+      results.set(date, { date, failed: true, error: '確認できた候補商品が足りませんでした' });
+      continue;
+    }
+    if (outageStreak >= CONFIG.GEMINI_OUTAGE_SLOTS) {
+      // 混雑・通信エラーが続いているときは、残りの日で長く待ち続けない
+      nextVerified.release(a.product);
+      results.set(date, { date, failed: true, transient: true, product: a.product, error: `Gemini の混雑・通信エラーが${outageStreak}日続いたため、この日は生成を見送りました` });
       continue;
     }
     const anniversary = await resolveAnniversary(date, a, anniversaries[date]);
@@ -201,6 +226,7 @@ async function runWeeklyPreview() {
       avoid.openings.push(post.opening);
       avoid.closings.push(post.closing);
     }
+    outageStreak = post.failed && post.transient ? outageStreak + 1 : 0;
     results.set(date, post);
   }
   // 7件そろってから、見出し・最後の一文・構成・切り口の似すぎを確かめ、似すぎた投稿を書き直す
@@ -215,13 +241,17 @@ async function runWeeklyPreview() {
   mkdirSync(dirname(file), { recursive: true });
   writeFileSync(file, renderWeeklyHtml({ weekStart, dates, posts, stats, anniversaries, assignmentNote, recorded, weekReview }));
 
+  const done = completeness(posts);
   summary([
     ...(IS_MOCK ? [`## ⚠ ${MOCK_LABEL}(テスト用モックで作成)`, ''] : []),
     `### 週次投稿案プレビュー ${formatDateJa(dates[0])} 〜 ${formatDateJa(dates.at(-1))}(Facebookには送信していません)`,
+    ...(done.problems.length
+      ? ['', `**⚠ 未完成: ${done.total}件中 ${done.ready}件のみ承認可能**`, ...done.problems.map(x => `- ${formatDateJa(x.date)}: ${x.title}${x.product ? `(${x.product})` : ''}`)]
+      : []),
     '',
-    '| 投稿日 | 商品 | 記念日 | 状態 |',
-    '|---|---|---|---|',
-    ...posts.map(p => `| ${formatDateJa(p.date)} | ${mdCell(slotTitle(p))} | ${mdCell(slotAnniversary(p))} | ${slotStatus(p)} |`),
+    '| 投稿日 | 商品 | ジャンル | 記念日 | 状態 |',
+    '|---|---|---|---|---|',
+    ...posts.map(p => `| ${formatDateJa(p.date)} | ${mdCell(slotTitle(p))} | ${mdCell(p.product?.genre || p.entry?.genre || '-')} | ${mdCell(slotAnniversary(p))} | ${slotStatus(p)} |`),
     '',
     `週全体の類似チェック: 似すぎ${weekReview.checked}件 → 書き直し${weekReview.rewritten.length}件 / 残り${weekReview.remaining}件`,
     recorded === null
@@ -331,14 +361,16 @@ function normalizeProduct(p) {
   let availability = 'unknown'; // 公開データに在庫情報が無い場合
   if (knownStock.some(v => v.available)) availability = 'in_stock';
   else if (knownStock.length > 0 && knownStock.length === variants.length) availability = 'sold_out';
+  const tags = Array.isArray(p.tags) ? p.tags.map(String) : String(p.tags || '').split(',').map(t => t.trim()).filter(Boolean);
   return {
+    genre: productGenre(String(p.title || ''), String(p.product_type || ''), tags),
     id: String(p.id),
     title: String(p.title || ''),
     handle: p.handle,
     url: `${CONFIG.SHOP_BASE_URL}/products/${p.handle}`,
     vendor: String(p.vendor || ''),
     productType: String(p.product_type || ''),
-    tags: Array.isArray(p.tags) ? p.tags.map(String) : String(p.tags || '').split(',').map(t => t.trim()).filter(Boolean),
+    tags,
     description: htmlToText(p.body_html),
     images: (p.images || []).map(img => img && img.src).filter(Boolean).slice(0, CONFIG.MAX_IMAGES),
     price: variants[0]?.price ?? '',
@@ -347,23 +379,62 @@ function normalizeProduct(p) {
   };
 }
 
+/** 商品名・種別・タグの言葉からジャンルを決める(説明文は使わない)。どれにも当たらなければ種別か「その他」 */
+function productGenre(title, productType, tags) {
+  const text = norm([title, productType, ...tags].join(' '));
+  for (const [genre, words] of CONFIG.GENRE_RULES) {
+    if (words.some(w => text.includes(norm(w)))) return genre;
+  }
+  return productType ? `その他(${productType})` : 'その他';
+}
+
 /**
  * 候補を先頭から1件ずつ確認し、確認できた商品を返す関数を作る。
- * 確認できなかった商品は stats.verifyFailures に理由と一緒に残し、MAX_VERIFY_FAILURES 件で打ち切る。
+ * - 同じジャンルが MAX_PER_GENRE 件に達したら、そのジャンルの商品は後回しにする
+ *   (候補を最後まで見ても足りないときだけ、後回しにした商品を使い、その旨を記録する)
+ * - 確認できなかった商品は stats.verifyFailures に理由と一緒に残し、MAX_VERIFY_FAILURES 件で打ち切る
+ * nextVerified.release(product) で、使わなかった商品のジャンルの枠を戻す。
  */
 function createVerifiedProductSource(pool, stats) {
   let index = 0;
+  const genreCount = new Map();
+  const deferred = [];
   stats.verifyFailures = [];
-  return async function nextVerified() {
-    while (index < pool.length && stats.verifyFailures.length < CONFIG.MAX_VERIFY_FAILURES) {
-      const product = pool[index++];
+  stats.genreDeferred = [];
+  stats.genreRelaxed = [];
+  const nextVerified = async function () {
+    while (stats.verifyFailures.length < CONFIG.MAX_VERIFY_FAILURES) {
+      let product;
+      if (index < pool.length) {
+        product = pool[index++];
+        if ((genreCount.get(product.genre) || 0) >= CONFIG.MAX_PER_GENRE) {
+          deferred.push(product);
+          stats.genreDeferred.push({ title: product.title, genre: product.genre });
+          continue;
+        }
+      } else if (deferred.length > 0) {
+        product = deferred.shift();
+        log(`ほかのジャンルの候補が足りないため、ジャンル上限を超えて使います: ${product.title}(${product.genre})`);
+      } else {
+        return null;
+      }
       const result = await verifyProduct(product);
-      if (result.ok) return result.product;
+      if (result.ok) {
+        if ((genreCount.get(product.genre) || 0) >= CONFIG.MAX_PER_GENRE) {
+          stats.genreRelaxed.push({ title: product.title, genre: product.genre });
+        }
+        genreCount.set(product.genre, (genreCount.get(product.genre) || 0) + 1);
+        return result.product;
+      }
       stats.verifyFailures.push({ title: product.title, url: product.url, checks: result.checks });
       log(`確認できなかったため使いません: ${product.title}(${result.checks.filter(c => !c.ok).map(c => `${c.label}: ${c.detail}`).join(' / ')})`);
     }
     return null;
   };
+  nextVerified.release = product => {
+    genreCount.set(product.genre, Math.max(0, (genreCount.get(product.genre) || 0) - 1));
+  };
+  return nextVerified;
 }
 
 /**
@@ -683,15 +754,28 @@ ${products.map(p => `- 商品ID: ${p.id} / ${p.title} / 種別: ${p.productType 
 
 /**
  * 1日分の投稿文を作る。ルールや事実確認に通らなければ作り直させ、それでも駄目なら予備の商品に差し替える。
- * どうしても通らない場合は、一番ましな案を「要確認」として返す(履歴には記録しない)。
+ * どうしても通らない場合は、一番ましな案を「要確認(承認不可)」として返す(履歴には記録しない)。
+ * 使わなかった商品はジャンルの枠を戻す。
  */
 async function generateForSlot(apiKey, slot, nextVerified, avoid, weekPosts = []) {
+  const tried = [];
+  const finish = result => {
+    for (const p of tried) if (result.failed || p !== result.product) nextVerified.release?.(p);
+    return result;
+  };
+  const post = await generateForSlotInner(apiKey, slot, nextVerified, avoid, weekPosts, tried);
+  return finish(post);
+}
+
+async function generateForSlotInner(apiKey, slot, nextVerified, avoid, weekPosts, tried) {
   const replaced = [];
   let best = null;
   let lastError = null;
+  let transient = false;
   for (let s = 0; s <= CONFIG.MAX_PRODUCT_SWITCHES; s++) {
     const product = s === 0 ? slot.product : await nextVerified();
     if (!product) break;
+    tried.push(product);
     let bestStyle = null;
     const anniversary = s === 0 ? slot.anniversary : null; // 差し替え後の商品には記念日を使わない
     const prompt = buildPostPrompt(slot.date, product, anniversary, avoid, weekPosts);
@@ -704,6 +788,7 @@ async function generateForSlot(apiKey, slot, nextVerified, avoid, weekPosts = []
         ({ data, model } = await callGeminiJson(apiKey, prompt + feedback));
       } catch (e) {
         lastError = e.message;
+        transient = Boolean(e.transient);
         errored = true;
         break;
       }
@@ -720,12 +805,29 @@ async function generateForSlot(apiKey, slot, nextVerified, avoid, weekPosts = []
     if (bestStyle) return bestStyle;
     if (errored && !best) {
       // Gemini 自体のエラーは商品を替えても直らないことが多いので、この日は失敗にする
-      return { date: slot.date, failed: true, error: `Gemini APIエラー: ${lastError}`, product, replaced };
+      return { date: slot.date, failed: true, transient, error: `Gemini APIエラー: ${lastError}`, product, replaced };
     }
     replaced.push({ title: product.title, reason: errored ? 'Gemini APIエラー' : 'ルール・事実確認を満たせなかった' });
   }
   if (best) return { ...best, ok: false, needsReview: true, replaced };
-  return { date: slot.date, failed: true, error: lastError ? `Gemini APIエラー: ${lastError}` : '確認できた候補商品が足りませんでした', replaced };
+  return { date: slot.date, failed: true, transient, error: lastError ? `Gemini APIエラー: ${lastError}` : '確認できた候補商品が足りませんでした', replaced };
+}
+
+/** 失敗・要確認の理由を、プレビュー向けの短い説明にする */
+function describeProblem(p) {
+  if (p.failed) {
+    const e = String(p.error || '');
+    if (/見送りました/.test(e)) return { title: 'Gemini の障害が続いたため生成を見送りました', detail: e };
+    if (/応答がありませんでした|fetch failed/.test(e) && !/503|UNAVAILABLE/.test(e)) return { title: 'Gemini との通信エラーで生成できませんでした', detail: e };
+    if (/混雑|503|UNAVAILABLE|RESOURCE_EXHAUSTED|429/.test(e)) return { title: 'Gemini が混雑していたため生成できませんでした', detail: e };
+    if (/候補商品が足りません/.test(e)) return { title: '確認できた候補商品が足りませんでした', detail: e };
+    return { title: '生成に失敗しました', detail: e };
+  }
+  if (p.needsReview) {
+    const reasons = [...p.factIssues, ...p.issues];
+    return { title: p.factIssues.length ? '事実確認に問題があるため承認できません' : 'ルールを満たせなかったため承認できません', detail: reasons.join(' / ') };
+  }
+  return null;
 }
 
 function problemCount(post) {
@@ -1013,35 +1115,64 @@ function evaluatePost(data, date, product, anniversary, avoid) {
 }
 
 /**
- * GEMINI_MODELS を先頭から試す。混雑(503)や上限(429)のときだけ次のモデルに切り替え、
- * それ以外のエラーはそのまま止める。APIキーはヘッダーでのみ送り、ログには出さない。
+ * GEMINI_MODELS を先頭から試す。混雑(503など)・上限(429)・通信エラー・時間切れ・出力の崩れのときは次のモデルへ。
+ * すべてのモデルで駄目なら GEMINI_RETRY_WAITS_MS だけ待って最初からやり直す。
+ * APIキーの誤りなど一時的でないエラーはすぐに止める。APIキーはヘッダーでのみ送り、ログには出さない。
+ * 投げるエラーには transient(一時的な障害か)を付ける。
  */
 async function callGeminiJson(apiKey, prompt) {
-  let json;
-  let model;
-  for (model of CONFIG.GEMINI_MODELS) {
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { responseMimeType: 'application/json', temperature: 1.0 }
-      })
-    });
-    json = await res.json();
-    const transient = json.error && ['UNAVAILABLE', 'RESOURCE_EXHAUSTED'].includes(json.error.status);
-    if (!transient) break;
-    log(`Gemini ${model} が一時的に使えないため次のモデルを試します: ${json.error.code} ${json.error.status}`);
+  const waits = [0, ...CONFIG.GEMINI_RETRY_WAITS_MS];
+  let last = '';
+  for (let round = 0; round < waits.length; round++) {
+    if (waits[round] > 0) {
+      log(`Gemini が混雑・通信エラーのため ${Math.round(waits[round] / 1000)} 秒待って再試行します(${round}/${waits.length - 1})`);
+      await sleep(waits[round]);
+    }
+    for (const model of CONFIG.GEMINI_MODELS) {
+      let json;
+      // 応答待ちが長引いたら打ち切る(本文の受信まで含めて GEMINI_TIMEOUT_MS)
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(Object.assign(new Error('timeout'), { name: 'TimeoutError' })), CONFIG.GEMINI_TIMEOUT_MS);
+      try {
+        const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { responseMimeType: 'application/json', temperature: 1.0 }
+          }),
+          signal: controller.signal
+        });
+        json = await res.json();
+      } catch (e) {
+        if (controller.signal.aborted) e = controller.signal.reason;
+        last = e?.name === 'TimeoutError'
+          ? `(${model}) ${Math.round(CONFIG.GEMINI_TIMEOUT_MS / 1000)}秒以内に応答がありませんでした`
+          : `(${model}) 通信エラー: ${e?.message || e}`;
+        log(`Gemini ${last} → 次のモデルを試します`);
+        continue;
+      } finally {
+        clearTimeout(timer);
+      }
+      if (json.error) {
+        last = `(${model}) ${json.error.code} ${json.error.status}: ${json.error.message}`;
+        const transient = ['UNAVAILABLE', 'RESOURCE_EXHAUSTED', 'DEADLINE_EXCEEDED', 'INTERNAL'].includes(json.error.status)
+          || [429, 500, 503, 504].includes(json.error.code);
+        if (!transient) throw Object.assign(new Error(last), { transient: false });
+        log(`Gemini ${model} が一時的に使えないため次のモデルを試します: ${json.error.code} ${json.error.status}`);
+        continue;
+      }
+      const rawText = json.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      const cleaned = rawText.trim().replace(/^```(json)?/i, '').replace(/```$/, '').trim();
+      try {
+        return { data: JSON.parse(cleaned), model };
+      } catch {
+        last = `(${model}) 出力をJSONとして解析できませんでした: ${rawText.slice(0, 120)}`;
+        log(`Gemini ${last} → 次のモデルを試します`);
+      }
+    }
   }
-  if (json.error) throw new Error(`(${model}) ${json.error.code} ${json.error.status}: ${json.error.message}`);
-
-  const rawText = json.candidates?.[0]?.content?.parts?.[0]?.text || '';
-  const cleaned = rawText.trim().replace(/^```(json)?/i, '').replace(/```$/, '').trim();
-  try {
-    return { data: JSON.parse(cleaned), model };
-  } catch {
-    throw new Error(`(${model}) 出力をJSONとして解析できませんでした: ${rawText.slice(0, 200)}`);
-  }
+  throw Object.assign(new Error(`混雑・通信エラーが続いたため生成できませんでした(${waits.length}巡試行。最後: ${last})`), { transient: true });
 }
 
 /** 本文に紛れ込んだ URL・ハッシュタグ・「▼詳細はこちら」を取り除く(後でコード側が付ける)。 */
@@ -1161,6 +1292,8 @@ function updateHistory(history, weekStart, dates, posts) {
       week: weekStart,
       status: 'candidate',
       dataSource: CONFIG.DATA_SOURCE,
+      genre: p.product.genre,
+      factCheck: 'passed', // 事実確認に通った投稿だけを記録する(承認できるのはこの記録だけ)
       opening: p.opening,
       closing: p.closing,
       generatedAt: now
@@ -1202,8 +1335,14 @@ function slotAnniversary(p) {
 function slotStatus(p) {
   if (p.locked) return `${STATUS_LABELS[p.entry.status]}(作り直さない)`;
   if (p.failed) return '失敗(履歴に記録しない)';
-  if (p.needsReview) return '要確認(履歴に記録しない)';
+  if (p.needsReview) return '承認不可(履歴に記録しない)';
   return '候補として記録';
+}
+
+/** 承認できる投稿(承認済み・公開済みを含む)の数と、エラー・承認不可の日の一覧 */
+function completeness(posts) {
+  const problems = posts.filter(p => !p.locked && (p.failed || p.needsReview)).map(p => ({ date: p.date, product: p.product?.title || '', ...describeProblem(p) }));
+  return { total: posts.length, ready: posts.length - problems.length, problems };
 }
 
 function renderWeeklyHtml({ weekStart, dates, posts, stats, anniversaries, assignmentNote, recorded, weekReview }) {
@@ -1217,10 +1356,14 @@ function renderWeeklyHtml({ weekStart, dates, posts, stats, anniversaries, assig
         <td class="${p.similarity?.length ? 'ng' : 'ok'}">${p.similarity?.length ? `⚠ ${p.similarity.map(esc).join('<br>⚠ ')}` : '✓'}${p.rewrittenFor ? '<br><span class="meta">似すぎていたため書き直し済み</span>' : ''}</td>
       </tr>`).join('');
   const generatedAt = new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
+  const done = completeness(posts);
+  const genreDeferred = stats.genreDeferred || [];
+  const genreRelaxed = stats.genreRelaxed || [];
   const rows = posts.map(p => `
       <tr>
         <td><a href="#d-${p.date}">${esc(formatDateJa(p.date))}</a></td>
         <td>${esc(slotTitle(p))}</td>
+        <td>${esc(p.product?.genre || p.entry?.genre || '-')}</td>
         <td>${esc(slotAnniversary(p))}</td>
         <td class="${p.failed || p.needsReview ? 'ng' : 'ok'}">${esc(slotStatus(p))}</td>
       </tr>`).join('');
@@ -1237,7 +1380,7 @@ function renderWeeklyHtml({ weekStart, dates, posts, stats, anniversaries, assig
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${IS_MOCK ? `【${MOCK_LABEL}】` : ''}週次投稿案プレビュー</title>
+<title>${IS_MOCK ? `【${MOCK_LABEL}】` : ''}${done.problems.length ? '【未完成】' : ''}週次投稿案プレビュー</title>
 <style>
   :root { --bg:#f0f2f5; --card:#fff; --text:#050505; --sub:#65676b; --line:#ced0d4; --soft:#f0f2f5; --warn:#fff4e5; --warn-line:#f0b45a; --ok:#2e7d32; --ng:#c62828; --accent:#1877f2; }
   @media (prefers-color-scheme: dark) {
@@ -1283,6 +1426,10 @@ function renderWeeklyHtml({ weekStart, dates, posts, stats, anniversaries, assig
   .mock-banner small { display:block; font-size:13px; font-weight:500; letter-spacing:0; }
   .mock-card { background:#c62828; color:#fff; font-size:18px; font-weight:800; text-align:center; padding:6px; border-radius:6px; margin:8px 0; }
   .post.mock { outline:4px dashed #c62828; outline-offset:-4px; }
+  .incomplete { background:var(--card); border:3px solid var(--ng); border-radius:8px; padding:12px 16px; margin:0 0 16px; }
+  .incomplete h2 { color:var(--ng); font-size:20px; }
+  .incomplete li b { color:var(--ng); }
+  .copy-btn:disabled { background:transparent; color:var(--sub); border-color:var(--line); cursor:not-allowed; filter:none; }
   @media (max-width: 480px) { main { padding:12px 16px; } .kv th { width:40%; } .mock-banner { font-size:22px; } }
 </style>
 </head>
@@ -1292,11 +1439,18 @@ ${IS_MOCK ? `<div class="mock-banner">⚠ ${MOCK_LABEL}<small>テスト用モッ
   <h1>週次投稿案プレビュー</h1>
   <div class="meta">${esc(formatDateJa(dates[0]))} 〜 ${esc(formatDateJa(dates.at(-1)))} / 作成 ${esc(generatedAt)} / データ: ${IS_MOCK ? '<b class="ng">テスト用モック</b>' : `実データ(${esc(CONFIG.SHOP_BASE_URL)})`}</div>
   <div class="notice">これはローカルのプレビューです。Facebookには何も送信していません(公開・未公開・予約投稿のいずれも行っていません)。</div>
-
+${done.problems.length ? `
+  <section class="incomplete" id="incomplete">
+    <h2>⚠ 未完成: ${done.total}件中 ${done.ready}件のみ承認可能</h2>
+    <p class="meta">次の日は投稿案ができていないか、承認できない状態です。作り直してから確認してください。</p>
+    <ul class="issues">
+      ${done.problems.map(x => `<li><a href="#d-${x.date}">${esc(formatDateJa(x.date))}</a> <b>${esc(x.title)}</b>${x.product ? `(${esc(x.product)})` : ''}<br><span class="meta">${esc(x.detail)}</span></li>`).join('')}
+    </ul>
+  </section>` : ''}
   <section class="panel">
     <h2>7日分の一覧</h2>
     <table>
-      <tr><th>投稿日</th><th>商品</th><th>記念日</th><th>状態</th></tr>${rows}
+      <tr><th>投稿日</th><th>商品</th><th>ジャンル</th><th>記念日</th><th>状態</th></tr>${rows}
     </table>
     <p class="meta">${recorded === null
       ? '<span class="ng">生成に成功した投稿がないため、候補履歴は変更していません</span>'
@@ -1322,6 +1476,10 @@ ${IS_MOCK ? `<div class="mock-banner">⚠ ${MOCK_LABEL}<small>テスト用モッ
     <ul class="issues">${excludedRows}</ul>
     <h3>商品ページ・画像を確認できず使わなかった商品</h3>
     <ul class="issues">${verifyFailures || '<li>なし</li>'}</ul>
+    <h3>ジャンルの偏りを避けるため後回しにした商品(同じジャンルは原則${CONFIG.MAX_PER_GENRE}件まで)</h3>
+    <ul class="issues">${genreDeferred.length
+      ? `<li>${genreDeferred.length}件<span class="meta">(${esc(genreDeferred.slice(0, 12).map(g => `${g.title}[${g.genre}]`).join('、'))}${genreDeferred.length > 12 ? ' ほか' : ''})</span></li>`
+      : '<li>なし</li>'}${genreRelaxed.map(g => `<li class="ng">候補が足りないため上限を超えて使用: ${esc(g.title)}[${esc(g.genre)}]</li>`).join('')}</ul>
   </section>
 
   ${posts.map(p => renderSlot(p, anniversaries[p.date])).join('\n')}
@@ -1341,14 +1499,18 @@ function renderSlot(p, day) {
       <p class="meta">承認済み・公開済みの日は作り直しません。</p></section>`;
   }
   if (p.failed) {
+    const why = describeProblem(p);
     return `<section class="panel" id="d-${p.date}">${heading}
-      <div class="badges"><span class="badge ng">失敗(履歴に記録しない)</span></div>
-      <p class="ng">${esc(p.error)}</p>${renderReplaced(p.replaced)}</section>`;
+      <div class="badges"><span class="badge ng">エラー・投稿案なし(履歴に記録しない)</span></div>
+      <p class="ng">${esc(why.title)}</p>
+      ${p.product ? `<p>予定していた商品: ${esc(p.product.title)}${p.product.genre ? `[${esc(p.product.genre)}]` : ''}</p>` : ''}
+      <p class="meta">詳細: ${esc(why.detail)}</p>${renderReplaced(p.replaced)}</section>`;
   }
 
   const prod = p.product;
   const messageHtml = renderMessageHtml(p.message, prod.url);
-  const copyLabel = IS_MOCK ? '投稿文をコピー(テスト用・投稿不可)' : p.needsReview ? '投稿文をコピー(要確認)' : '投稿文をコピー';
+  const copyLabel = IS_MOCK ? '投稿文をコピー(テスト用・投稿不可)' : '投稿文をコピー';
+  const blocked = p.needsReview ? describeProblem(p) : null; // 事実確認・ルールに問題がある投稿は承認・コピーさせない
   const photos = prod.images.length
     ? `<div class="photos n${prod.images.length}">${prod.images.map(src => `<img src="${esc(src)}" alt="${esc(prod.title)}" loading="lazy">`).join('')}</div>`
     : '';
@@ -1373,18 +1535,22 @@ function renderSlot(p, day) {
     ${heading}
     <div class="badges">
       ${sources.map(s => `<span class="badge">${esc(s)}</span>`).join('')}
+      <span class="badge">${esc(prod.genre)}</span>
       <span class="badge${prod.availability === 'unknown' ? ' ng' : ''}">${esc(AVAILABILITY_LABELS[prod.availability])}</span>
-      <span class="badge${p.needsReview ? ' ng' : ''}">${p.needsReview ? '要確認(履歴に記録しない)' : '候補として記録'}</span>
+      <span class="badge${blocked ? ' ng' : ''}">${blocked ? '承認不可(履歴に記録しない)' : '候補として記録'}</span>
     </div>
+    ${blocked ? `<p class="ng">${esc(blocked.title)}: ${esc(blocked.detail)}</p>` : ''}
     <div class="post${IS_MOCK ? ' mock' : ''}">
       <div class="head"><div class="avatar">ふ</div><div><b>ふくしま市場</b><div class="meta">${esc(formatDateJa(p.date))} 投稿予定</div></div></div>
       <div class="message">${messageHtml}</div>
       ${photos}
     </div>
     <div class="copy-row">
-      <button type="button" class="copy-btn${p.needsReview || IS_MOCK ? ' warn' : ''}">${esc(copyLabel)}</button>
+      ${blocked
+        ? `<button type="button" class="copy-btn" disabled>承認不可のためコピーできません</button>`
+        : `<button type="button" class="copy-btn${IS_MOCK ? ' warn' : ''}">${esc(copyLabel)}</button>
       <span class="copy-status meta" role="status" aria-live="polite"></span>
-      <textarea class="copy-src" readonly hidden>${esc(p.message)}</textarea>
+      <textarea class="copy-src" readonly hidden>${esc(p.message)}</textarea>`}
     </div>
 
     <h3>チェック</h3>
@@ -1473,7 +1639,7 @@ async function politeFetch(url, { method = 'GET', retry = true } = {}) {
     const wait = (lastRequestAt.get(host) || 0) + CONFIG.REQUEST_INTERVAL_MS - Date.now();
     if (wait > 0) await sleep(wait);
     lastRequestAt.set(host, Date.now());
-    const res = await fetch(url, { method, headers: { 'User-Agent': CONFIG.USER_AGENT } });
+    const res = await fetch(url, { method, headers: { 'User-Agent': CONFIG.USER_AGENT }, signal: AbortSignal.timeout(CONFIG.FETCH_TIMEOUT_MS) });
     if (retry && (res.status === 429 || res.status === 503) && attempt < CONFIG.MAX_FETCH_RETRIES) {
       const retryAfter = Number(res.headers?.get?.('retry-after'));
       const ms = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : CONFIG.RETRY_WAIT_MS * (attempt + 1);

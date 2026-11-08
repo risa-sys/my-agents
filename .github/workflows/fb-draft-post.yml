@@ -24,8 +24,9 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 50 # Gemini の待機・再試行を含めても、これ以上は止める
     permissions:
-      contents: read # main へは自動コミットしない(履歴は Artifacts に保存する)
+      contents: read # この job は書き込まない(履歴の保存は save-history job だけが行う)
       issues: write # トークンの期限が近いときに Issue で知らせるため(check のみ)
     steps:
       - uses: actions/checkout@v4
@@ -33,6 +34,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+
+      - name: Restore candidate history (fb-history branch)
+        if: ${{ inputs.mode == 'preview' }}
+        run: bash scripts/fb-history-branch.sh restore
 
       - name: Run (${{ inputs.mode }})
         id: post
@@ -56,6 +61,14 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+      - name: Upload history for save-history job
+        if: ${{ inputs.mode == 'preview' && success() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: fb-history-to-save
+          path: data/fb-post-history.json
+          retention-days: 1
+
       - name: Notify token expiry
         if: ${{ steps.post.outputs.token_days_left != '' }}
         env:
@@ -69,3 +82,23 @@ jobs:
 
           Meta Business Suite のシステムユーザーでトークンを再生成し、
           \`gh secret set FB_PAGE_ACCESS_TOKEN\` で差し替えてください。差し替えたらこの Issue を閉じてください。"
+
+  # 候補履歴を専用ブランチ fb-history に保存する(次回の生成で前後30日の重複防止に使う)。
+  # main には書き込まない。書き込み権限を持つのはこの job だけで、生成処理は動かさない。
+  save-history:
+    needs: run
+    if: ${{ inputs.mode == 'preview' && needs.run.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: fb-history-to-save
+          path: data
+
+      - name: Save candidate history to fb-history branch
+        run: bash scripts/fb-history-branch.sh save
