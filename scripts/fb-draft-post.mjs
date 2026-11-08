@@ -40,7 +40,19 @@ const CONFIG = {
   HISTORY_FILE: 'data/fb-posted-history.json',
   HISTORY_RETENTION_DAYS: 30,
   HISTORY_MAX_ENTRIES: 60,
-  TOKEN_WARN_DAYS: 14 // トークンの残り日数がこれを切ったら Issue で知らせる
+  TOKEN_WARN_DAYS: 14, // トークンの残り日数がこれを切ったら Issue で知らせる
+  // 投稿文のルール(公式Xアカウント https://x.com/fukushima_18 の雰囲気に合わせる)
+  BODY_MIN_CHARS: 100, // 本文の文字数(改行・URL・ハッシュタグを除く)
+  BODY_MAX_CHARS: 180,
+  MAX_EMOJI: 2,
+  // 誇張・不自然な宣伝文句。含まれていたら作り直させる
+  NG_PHRASES: ['最高', '絶品', '今だけ', 'お見逃しなく', '見逃し厳禁', '必見', '激安', '間違いなし', 'ヤバい', 'やばい', '!!', '！！'],
+  HASHTAGS: '#ふくしま市場 #福島県',
+  MAX_IMAGES: 2,
+  GEMINI_MAX_ATTEMPTS: 3, // ルールを外れた本文が返ってきたら、理由を添えて作り直させる
+  // 参考にしたい公式Xの投稿文を置くと、文体の手本としてプロンプトに入る(投稿ごとに "---" 行で区切る)
+  STYLE_EXAMPLES_FILE: 'data/fb-style-examples.txt',
+  RECENT_OPENINGS_COUNT: 10 // 言い回しが続かないよう、直近の書き出しを避けさせる
 };
 
 const MODES = ['preview', 'check', 'draft'];
@@ -82,12 +94,12 @@ async function main() {
   const products = await collectProductsOrThrow();
   const { draft, product, productUrl } = await composePost(products);
   const postId = await createDraftPost(pageId, page.accessToken, draft.message, productUrl);
-  recordProductAsPosted(product.handle);
+  recordProductAsPosted(product.handle, draft.opening);
   log(`Facebook下書き作成完了: ${postId}`);
 
   summary([
     '### Facebook下書きを作成しました',
-    `- 話題: ${draft.theme}`,
+    `- 記念日: ${describeAnniversary(draft)}`,
     `- 商品: ${product.title}(${product.price}円)`,
     `- 商品ページ: ${productUrl}`,
     `- 投稿ID: ${postId}`,
@@ -113,10 +125,12 @@ async function runPreview() {
 
   summary([
     '### 投稿文プレビュー(Facebookには送信していません)',
-    `- 話題: ${draft.theme}`,
+    `- 記念日: ${describeAnniversary(draft)}`,
     `- 商品: ${product.title}(${product.price}円)`,
     `- 商品ページ: ${productUrl}`,
-    `- 画像: ${product.image || '(なし)'}`,
+    `- 画像: ${product.images.join(' , ') || '(なし)'}`,
+    `- 本文: ${draft.bodyChars}文字 / 絵文字${draft.emojiCount}個`,
+    ...draft.warnings.map(w => `- ⚠ ${w}`),
     '',
     '```',
     draft.message,
@@ -134,18 +148,35 @@ async function collectProductsOrThrow() {
   return products;
 }
 
+/**
+ * 投稿の構成: 導入+商品紹介(Geminiが作る本文)→「▼詳細はこちら」→ 商品URL → ハッシュタグ。
+ * URLとハッシュタグは誤りが出ないようコード側で付ける。
+ */
 async function composePost(products) {
   const draft = await generateDraftWithGemini(products);
   const product = products.find(p => p.handle === draft.product_handle) || products[0];
   const productUrl = `${CONFIG.SHOP_BASE_URL}/products/${product.handle}`;
+  draft.message = `${draft.body}\n\n▼詳細はこちら\n${productUrl}\n\n${CONFIG.HASHTAGS}`;
   return { draft, product, productUrl };
+}
+
+function describeAnniversary(draft) {
+  if (!draft.anniversary) return 'なし(通常の商品紹介)';
+  return String(draft.anniversary_used) === 'true'
+    ? `${draft.anniversary}(使用)`
+    : `${draft.anniversary}(関連が弱いため不使用)`;
 }
 
 function renderPreviewHtml({ draft, product, productUrl, candidateCount }) {
   const generatedAt = new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
   const paramRows = Object.entries(draftPostParams(draft.message, productUrl))
     .map(([k, v]) => `<tr><th>${esc(k)}</th><td class="pre">${esc(v)}</td></tr>`).join('');
-  const domain = new URL(productUrl).hostname.toUpperCase();
+  const messageHtml = esc(draft.message).replace(esc(productUrl), `<a href="${esc(productUrl)}" target="_blank" rel="noopener">${esc(productUrl)}</a>`);
+  const images = product.images.slice(0, CONFIG.MAX_IMAGES);
+  const photos = images.length
+    ? `<div class="photos n${images.length}">${images.map(src => `<img src="${esc(src)}" alt="${esc(product.title)}">`).join('')}</div>`
+    : '<div class="noimg">画像なし</div>';
+  const rangeOk = draft.bodyChars >= CONFIG.BODY_MIN_CHARS && draft.bodyChars <= CONFIG.BODY_MAX_CHARS;
   return `<!doctype html>
 <html lang="ja">
 <head>
@@ -168,12 +199,12 @@ function renderPreviewHtml({ draft, product, productUrl, candidateCount }) {
   .name { font-weight:600; font-size:15px; }
   .meta { color:var(--sub); font-size:13px; }
   .message { padding:12px 16px; white-space:pre-wrap; font-size:15px; line-height:1.4; overflow-wrap:anywhere; }
-  .card { display:block; color:inherit; text-decoration:none; border-top:1px solid var(--line); }
-  .card img { display:block; width:100%; aspect-ratio:1.91/1; object-fit:cover; background:var(--line); }
-  .card .noimg { aspect-ratio:1.91/1; display:grid; place-items:center; color:var(--sub); background:var(--link); }
-  .card .info { background:var(--link); padding:10px 12px; }
-  .card .domain { color:var(--sub); font-size:12px; }
-  .card .title { font-weight:600; font-size:16px; margin-top:2px; }
+  .photos { display:grid; gap:2px; }
+  .photos.n2 { grid-template-columns:1fr 1fr; }
+  .photos img { display:block; width:100%; aspect-ratio:1/1; object-fit:cover; background:var(--line); }
+  .photos.n1 img { aspect-ratio:auto; max-height:560px; }
+  .noimg { aspect-ratio:1.91/1; display:grid; place-items:center; color:var(--sub); background:var(--link); }
+  .ok { color:#2e7d32; } .ng { color:#c62828; font-weight:600; }
   h2 { font-size:15px; margin:24px 0 8px; }
   table { width:100%; border-collapse:collapse; font-size:13px; background:var(--card); border-radius:8px; overflow:hidden; }
   th, td { text-align:left; vertical-align:top; padding:6px 10px; border-bottom:1px solid var(--line); overflow-wrap:anywhere; }
@@ -189,26 +220,30 @@ function renderPreviewHtml({ draft, product, productUrl, candidateCount }) {
       <div class="avatar">ふ</div>
       <div><div class="name">ふくしま市場</div><div class="meta">プレビュー · ${esc(generatedAt)}</div></div>
     </div>
-    <div class="message">${esc(draft.message)}</div>
-    <a class="card" href="${esc(productUrl)}" target="_blank" rel="noopener">
-      ${product.image ? `<img src="${esc(product.image)}" alt="${esc(product.title)}">` : '<div class="noimg">画像なし</div>'}
-      <div class="info"><div class="domain">${esc(domain)}</div><div class="title">${esc(product.title)}</div></div>
-    </a>
+    <div class="message">${messageHtml}</div>
+    ${photos}
   </article>
 
-  <h2>内容</h2>
+  <h2>チェック</h2>
   <table>
-    <tr><th>話題</th><td>${esc(draft.theme)}</td></tr>
+    <tr><th>本文の文字数<br>(URL・ハッシュタグ・改行を除く)</th><td class="${rangeOk ? 'ok' : 'ng'}">${draft.bodyChars}文字(目安 ${CONFIG.BODY_MIN_CHARS}〜${CONFIG.BODY_MAX_CHARS})</td></tr>
+    <tr><th>絵文字</th><td class="${draft.emojiCount <= CONFIG.MAX_EMOJI ? 'ok' : 'ng'}">${draft.emojiCount}個(上限 ${CONFIG.MAX_EMOJI})</td></tr>
+    <tr><th>記念日</th><td>${esc(describeAnniversary(draft))}${draft.anniversary_reason ? `<br><span class="meta">${esc(draft.anniversary_reason)}</span>` : ''}</td></tr>
+    <tr><th>注意</th><td class="${draft.warnings.length ? 'ng' : 'ok'}">${draft.warnings.length ? draft.warnings.map(esc).join('<br>') : 'なし'}</td></tr>
+  </table>
+
+  <h2>商品</h2>
+  <table>
     <tr><th>商品</th><td>${esc(product.title)}(${esc(product.price)}円)</td></tr>
+    <tr><th>販売者</th><td>${esc(product.vendor)}</td></tr>
     <tr><th>商品ページ</th><td><a href="${esc(productUrl)}" target="_blank" rel="noopener">${esc(productUrl)}</a></td></tr>
-    <tr><th>画像URL</th><td>${product.image ? `<a href="${esc(product.image)}" target="_blank" rel="noopener">${esc(product.image)}</a>` : '(なし)'}</td></tr>
-    <tr><th>文字数</th><td>${[...draft.message].length}文字</td></tr>
+    <tr><th>画像URL</th><td>${images.length ? images.map(src => `<a href="${esc(src)}" target="_blank" rel="noopener">${esc(src)}</a>`).join('<br>') : '(なし)'}</td></tr>
     <tr><th>候補商品数</th><td>${candidateCount}件</td></tr>
   </table>
 
   <h2>draft モードで送信される場合のパラメータ(今回は未送信)</h2>
   <table>${paramRows}<tr><th>access_token</th><td>(表示しません)</td></tr></table>
-  <p class="meta">画像はFacebookがリンク先ページから自動取得するため、実際の表示はこのプレビューと異なる場合があります。</p>
+  <p class="meta">現在の draft モードはリンク投稿(画像はFacebookが商品ページから自動取得)で、上の画像1〜2枚の添付には未対応です。</p>
 </main>
 </body>
 </html>
@@ -344,11 +379,21 @@ async function fetchShopifyProducts(path) {
         productType: p.product_type,
         tags: Array.isArray(p.tags) ? p.tags.join(', ') : p.tags,
         price: p.variants[0].price,
-        image: p.images?.[0]?.src || ''
+        description: htmlToText(p.body_html).slice(0, 300),
+        images: (p.images || []).map(img => img.src).filter(Boolean).slice(0, CONFIG.MAX_IMAGES)
       }));
   } catch {
     return [];
   }
+}
+
+function htmlToText(html) {
+  return String(html || '')
+    .replace(/<(script|style)[\s\S]*?<\/\1>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function loadHistory() {
@@ -365,10 +410,14 @@ function getPostedProductHandles() {
   return new Set(loadHistory().filter(e => e.postedAt >= cutoff).map(e => e.handle));
 }
 
-function recordProductAsPosted(handle) {
+function getRecentOpenings() {
+  return loadHistory().map(e => e.opening).filter(Boolean).slice(-CONFIG.RECENT_OPENINGS_COUNT);
+}
+
+function recordProductAsPosted(handle, opening) {
   const cutoff = Date.now() - CONFIG.HISTORY_RETENTION_DAYS * 24 * 60 * 60 * 1000;
   const history = loadHistory().filter(e => e.postedAt >= cutoff);
-  history.push({ handle, postedAt: Date.now() });
+  history.push({ handle, opening, postedAt: Date.now() });
   writeFileSync(CONFIG.HISTORY_FILE, JSON.stringify(history.slice(-CONFIG.HISTORY_MAX_ENTRIES), null, 2) + '\n');
 }
 
@@ -379,47 +428,70 @@ async function generateDraftWithGemini(products) {
   }).format(new Date());
 
   const productListText = products.map(p =>
-    `- タイトル: ${p.title} / 価格: ${p.price}円 / 販売者: ${p.vendor} / 種別: ${p.productType} / タグ: ${p.tags} / handle: ${p.handle}`
+    `- タイトル: ${p.title} / 価格: ${p.price}円 / 販売者(生産者): ${p.vendor} / 種別: ${p.productType} / タグ: ${p.tags} / handle: ${p.handle}\n  説明: ${p.description || '(なし)'}`
   ).join('\n');
+  const examples = loadStyleExamples();
+  const recentOpenings = getRecentOpenings();
 
   const prompt = `
 あなたは「ふくしま市場」(福島県産品のオンラインストア、https://fukushima-ichiba.com/)の
-公式FacebookページのSNS担当者です。
-このFacebook投稿の目的は、読んだ人がふくしま市場のサイトを訪れて商品を購入したくなることです。
+SNS担当者です。公式Xアカウント(@fukushima_18)の投稿のような、シンプルで読みやすい
+Facebook投稿の本文を書いてください。
 
 今日の日付: ${dateText}
 
 手順:
-1. 今日の日付にまつわる話題(記念日・行事・旬の食べ物・季節感など)の中から、
-   福島や下記の商品と無理なく繋げられるものを1つ選ぶ。
-   広く知られている一般的な話題だけを使い、確信が持てない記念日は使わない
-   (不確かな場合は季節感や旬だけを使ってよい)。
-2. 下記の商品候補リストの中から、その話題と最も相性が良い商品を1つ選ぶ。
-   リストに無い商品は絶対に登場させない。
-3. 選んだ話題と商品を絡めた、Facebookページ用の投稿文を書く。
+1. 下記の商品候補リストから紹介する商品を1つ選ぶ。リストに無い商品は絶対に登場させない。
+2. 今日が記念日・行事の日で、選んだ商品と自然な関連がある場合だけ、それを導入に使う。
+   - 広く知られていて確信が持てる記念日だけを使う
+   - 関連が弱い・こじつけになる場合は使わず、通常の商品紹介にする(無理に結びつけない)
+   - 使う場合も、記念日の説明は短く一言で済ませる
+3. 本文を書く。
 
-投稿文の条件:
-- 日本語。絵文字は控えめに1〜3個まで
-- 冒頭数行で興味を引き、商品の魅力(産地・味わい・使い道など)を伝える
-- 最後に購入を後押しする一文を入れる(例:「下記リンクからチェックしてみてください」)
-- 文末にハッシュタグを3〜5個つける(例: #ふくしま市場 #福島 #お取り寄せグルメ など商品に合わせて選ぶ)
-- 全体で200〜400文字程度
-- 商品名や産地など、リストに無い情報を捏造しない
+本文の構成:
+1行目: 商品や記念日に関する短い導入
+続けて2〜4行: 商品名・産地・生産者・特徴を簡潔に、魅力は具体的に(味・食感・食べ方・量など)
 
+本文のルール:
+- 日本語。改行・URL・ハッシュタグを除いて${CONFIG.BODY_MIN_CHARS}〜${CONFIG.BODY_MAX_CHARS}文字
+- 絵文字は0〜${CONFIG.MAX_EMOJI}個
+- 誇張表現や不自然な宣伝文句(「最高」「絶品」「今だけ」「お見逃しなく」など)は使わない
+- 商品名・産地・生産者など、リストに無い情報を捏造しない(分からない項目は書かない)
+- 「▼詳細はこちら」、URL、ハッシュタグは本文に入れない(後から自動で付ける)
+- 毎回同じ言い回しにならないよう、書き出しや文の組み立てを変える
+${recentOpenings.length ? `- 最近の投稿の書き出しは次のとおり。これらと似た書き出しは避ける:\n${recentOpenings.map(o => `  ・${o}`).join('\n')}` : ''}
+${examples.length ? `\n公式Xの投稿例(雰囲気の参考。文章をそのまま流用しない):\n${examples.map(e => `---\n${e}`).join('\n')}\n---\n` : ''}
 出力は次のJSON形式のみ。前後に説明文やコードブロック記号は一切つけないこと。
-{"theme": "選んだ話題", "product_handle": "選んだ商品のhandle", "message": "投稿本文"}
+{"anniversary": "検討した今日の記念日(無ければ空文字)", "anniversary_used": true または false, "anniversary_reason": "使った/使わなかった理由を一言", "product_handle": "選んだ商品のhandle", "body": "本文"}
 
 商品候補リスト:
 ${productListText}
 `;
 
+  let draft;
+  let feedback = '';
+  for (let attempt = 1; attempt <= CONFIG.GEMINI_MAX_ATTEMPTS; attempt++) {
+    draft = await callGemini(apiKey, prompt + feedback);
+    draft.body = cleanBody(draft.body);
+    draft.bodyChars = countBodyChars(draft.body);
+    draft.emojiCount = countEmoji(draft.body);
+    draft.opening = draft.body.split('\n')[0].slice(0, 40);
+    draft.warnings = checkBodyRules(draft);
+    if (draft.warnings.length === 0) break;
+    log(`投稿文がルールを外れたため作り直します(${attempt}回目): ${draft.warnings.join(' / ')}`);
+    feedback = `\n\n前回の本文は次の点がルール違反でした。直して書き直してください: ${draft.warnings.join(' / ')}\n前回の本文:\n${draft.body}\n`;
+  }
+  return draft;
+}
+
+async function callGemini(apiKey, prompt) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${CONFIG.GEMINI_MODEL}:generateContent`;
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
     body: JSON.stringify({
       contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { responseMimeType: 'application/json' }
+      generationConfig: { responseMimeType: 'application/json', temperature: 1.0 }
     })
   });
   const json = await res.json();
@@ -433,10 +505,50 @@ ${productListText}
   } catch {
     throw new Error('Geminiの出力をJSONとして解析できませんでした: ' + rawText);
   }
-  if (!draft.message || !draft.product_handle) {
-    throw new Error('Geminiの出力に必要な項目(message / product_handle)がありません: ' + rawText);
+  if (!draft.body || !draft.product_handle) {
+    throw new Error('Geminiの出力に必要な項目(body / product_handle)がありません: ' + rawText);
   }
   return draft;
+}
+
+/** 本文に紛れ込んだ URL・ハッシュタグ・「▼詳細はこちら」を取り除く(後でコード側が付ける)。 */
+function cleanBody(body) {
+  return String(body)
+    .replace(/https?:\/\/\S+/g, '')
+    .replace(/▼?\s*詳細はこちら/g, '')
+    .replace(/(^|\s)#[^\s#]+/g, '$1')
+    .split('\n').map(line => line.trim()).join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function countBodyChars(body) {
+  return [...body.replace(/\s/g, '')].length;
+}
+
+function countEmoji(text) {
+  return (text.match(/\p{Extended_Pictographic}/gu) || []).length;
+}
+
+function checkBodyRules(draft) {
+  const warnings = [];
+  if (draft.bodyChars < CONFIG.BODY_MIN_CHARS || draft.bodyChars > CONFIG.BODY_MAX_CHARS) {
+    warnings.push(`本文が${draft.bodyChars}文字(目安 ${CONFIG.BODY_MIN_CHARS}〜${CONFIG.BODY_MAX_CHARS}文字)`);
+  }
+  if (draft.emojiCount > CONFIG.MAX_EMOJI) {
+    warnings.push(`絵文字が${draft.emojiCount}個(上限 ${CONFIG.MAX_EMOJI}個)`);
+  }
+  const ng = CONFIG.NG_PHRASES.filter(p => draft.body.includes(p));
+  if (ng.length) warnings.push(`誇張・宣伝的な表現: ${ng.join('、')}`);
+  return warnings;
+}
+
+function loadStyleExamples() {
+  if (!existsSync(CONFIG.STYLE_EXAMPLES_FILE)) return [];
+  return readFileSync(CONFIG.STYLE_EXAMPLES_FILE, 'utf8')
+    .split(/^---\s*$/m)
+    .map(s => s.trim())
+    .filter(Boolean);
 }
 
 /**
