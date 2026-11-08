@@ -5,7 +5,10 @@
     "login": "clasp login",
     "push": "clasp push -f",
     "open": "clasp open",
-    "fb:preview": "node scripts/fb-draft-post.mjs"
+    "fb:preview": "node scripts/fb-draft-post.mjs",
+    "fb:review-page": "node scripts/fb-review.mjs page",
+    "fb:apply": "node scripts/fb-review.mjs apply",
+    "fb:migrate": "node scripts/fb-review.mjs migrate"
   },
   "devDependencies": {
     "@google/clasp": "^2.4.2"

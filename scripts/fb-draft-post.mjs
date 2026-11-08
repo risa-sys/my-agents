@@ -23,6 +23,8 @@
 import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { RULES, unsupportedNumbers } from './fb-review-rules.mjs';
+import { hashOf, reviewAssets, reviewBar, reviewRecordFromEntry, reviewWidget } from './fb-review-ui.mjs';
 
 const CONFIG = {
   // 先頭から順に使う。2つ目以降は先頭が混雑・上限・通信エラーで使えないときの予備
@@ -34,11 +36,14 @@ const CONFIG = {
   GEMINI_RETRY_WAITS_MS: String(process.env.GEMINI_RETRY_WAITS_MS ?? '30000,60000').split(',').map(Number),
   GEMINI_OUTAGE_SLOTS: 2, // 混雑・通信エラーで生成できない日がこれだけ続いたら、残りの日は待たずに見送る
   // 同じモデルへの呼び出し間隔。上限は「プロジェクト×モデルごと」に数えられるため、モデル単位であける
-  GEMINI_MIN_INTERVAL_MS: Number(process.env.GEMINI_MIN_INTERVAL_MS ?? 6000),
+  // (gemini-3.6-flash の上限は 1分5回=12秒に1回。2026-11-09 に AI Studio で確認。余裕をみて15秒)
+  GEMINI_MIN_INTERVAL_MS: Number(process.env.GEMINI_MIN_INTERVAL_MS ?? 15000),
   // 429 で示された待ち時間(retryDelay)がこれ以内なら、待って同じモデルでやり直す
   GEMINI_MAX_RETRY_DELAY_MS: Number(process.env.GEMINI_MAX_RETRY_DELAY_MS ?? 65000),
-  GEMINI_MAX_ATTEMPTS: 3, // ルールを外れた本文は、理由を添えて作り直させる
-  MAX_PRODUCT_SWITCHES: 2, // それでも直らないときに、予備の商品へ差し替える回数
+  // 1日の上限(gemini-3.6 / 3.8 とも1日20回。2026-11-09 に AI Studio で確認)を使い切らないよう、呼び出しを節約する
+  GEMINI_CALL_BUDGET: Number(process.env.GEMINI_CALL_BUDGET ?? 20), // 1回の実行で Gemini を呼ぶ上限(失敗した呼び出しも数える)
+  GEMINI_MAX_ATTEMPTS: 2, // ルールを外れた本文は、理由を添えて1回だけ作り直させる
+  MAX_PRODUCT_SWITCHES: 1, // それでも直らないときに、予備の商品へ差し替える回数
   GRAPH_API_VERSION: 'v26.0',
 
   // 商品情報(Shopify の公開データ)
@@ -86,20 +91,19 @@ const CONFIG = {
   // 週次の生成と履歴
   DAYS_PER_BATCH: 7,
   HISTORY_FILE: process.env.HISTORY_FILE || 'data/fb-post-history.json', // テストでは *.test.json しか使えない
-  // candidate=プレビューで選んだ候補 / approved=投稿すると承認した / published=公開済み
-  HISTORY_STATUSES: ['candidate', 'approved', 'published'],
+  // candidate=プレビューで選んだ候補 / approved=承認した(修正して承認を含む) / rejected=不採用 / published=公開済み
+  HISTORY_STATUSES: ['candidate', 'approved', 'rejected', 'published'],
   REUSE_BLOCK_DAYS: 30, // 投稿予定日の前後この日数に選ばれた商品は選ばない
   RECENT_PHRASES_COUNT: 14, // 書き出し・締めくくりが続かないよう、直近の分を避けさせる
   PREVIEW_DIR: 'preview',
 
-  // 投稿文のルール
-  BODY_MIN_CHARS: 100, // 本文の文字数の目安(改行・空白・URL・ハッシュタグを除く)。下回っても作り直さない
-  BODY_MAX_CHARS: 180, // 上回ったら作り直させる
-  MAX_EMOJI: 2,
-  NG_PHRASES: ['最高', '絶品', '今だけ', 'お見逃しなく', '見逃し厳禁', '必見', '激安', '間違いなし', 'ヤバい', 'やばい', '!!', '！！'],
+  // 投稿文のルール(文字数・絵文字・誇張表現・定型表現・ハッシュタグは承認管理の修正チェックと共通: fb-review-rules.mjs)
+  BODY_MIN_CHARS: RULES.BODY_MIN_CHARS, // 本文の文字数の目安(改行・空白・URL・ハッシュタグを除く)。下回っても作り直さない
+  BODY_MAX_CHARS: RULES.BODY_MAX_CHARS, // 上回ったら作り直させる
+  MAX_EMOJI: RULES.MAX_EMOJI,
+  NG_PHRASES: RULES.NG_PHRASES,
   // 汎用的な締めの定型表現。本文に含まれていたら作り直させる
-  STOCK_PHRASES: ['お楽しみください', 'おすすめです', 'おすすめします', 'いかがでしょうか', 'いかがですか', 'ご賞味ください',
-    'お試しください', '味わってみてください', '取り入れてみませんか', 'チェックしてみてください', 'ご覧ください', 'お届けします'],
+  STOCK_PHRASES: RULES.STOCK_PHRASES,
   // 投稿の切り口(Gemini にどれか1つを選ばせ、同じ週で偏らないようにする)
   FOCUS_TYPES: ['味', '食感', '香り', '食べ方・使い方', '製法', '産地・育ち', '生産者', '季節', 'その他'],
   // 週全体の類似チェック
@@ -109,10 +113,10 @@ const CONFIG = {
   SAME_FOCUS_LIMIT: 3, // 切り口が同じ投稿はこの件数まで(見出し・本文・締めの類似は別に確かめる)
   SAME_HEADLINE_SHAPE_LIMIT: 3, // 絵文字や「」を使う見出しで、形(絵文字の有無・「」の位置)が同じ投稿はこの件数まで
   MAX_EMOJI_HEADLINES: 4, // 絵文字で始まる見出しはこの件数まで(7件中)
-  WEEK_REWRITE_LIMIT: 4, // 類似で書き直す投稿の上限(1回の実行あたり)
-  WEEK_REWRITE_ATTEMPTS: 2, // 1投稿あたりの書き直し回数
-  FIXED_HASHTAGS: ['#ふくしま市場', '#福島県'],
-  EXTRA_HASHTAGS: 2, // 商品情報から選ぶハッシュタグの数(固定と合わせて4個)
+  WEEK_REWRITE_LIMIT: 2, // 類似で書き直す投稿の上限(1回の実行あたり。呼び出し回数を節約する)
+  WEEK_REWRITE_ATTEMPTS: 1, // 1投稿あたりの書き直し回数
+  FIXED_HASHTAGS: RULES.FIXED_HASHTAGS,
+  EXTRA_HASHTAGS: RULES.EXTRA_HASHTAGS, // 商品情報から選ぶハッシュタグの数(固定と合わせて4個)
   // 参考にしたい公式Xの投稿文を置くと、文体の手本としてプロンプトに入る(投稿ごとに "---" 行で区切る)
   STYLE_EXAMPLES_FILE: 'data/fb-style-examples.txt',
 
@@ -136,7 +140,7 @@ const MOCK_LABEL = 'テスト用データ・投稿不可';
 
 const SOURCE_LABELS = { ranking: '人気ランキング', new: '新商品', all: '全商品' };
 const AVAILABILITY_LABELS = { in_stock: '在庫あり', sold_out: '売り切れ', unknown: '在庫未確認' };
-const STATUS_LABELS = { candidate: '候補', approved: '承認済み', published: '公開済み' };
+const STATUS_LABELS = { candidate: '候補', approved: '承認済み', rejected: '不採用', published: '公開済み' };
 
 async function main() {
   if (!MODES.includes(MODE)) {
@@ -193,7 +197,7 @@ async function runWeeklyPreview() {
   const history = loadHistory();
   // 承認済み・公開済みの日は作り直さない
   const lockedByDate = new Map(history.entries
-    .filter(e => e.status !== 'candidate' && dates.includes(e.postDate))
+    .filter(e => (e.status === 'approved' || e.status === 'published') && dates.includes(e.postDate))
     .map(e => [e.postDate, e]));
   const openDates = dates.filter(d => !lockedByDate.has(d));
 
@@ -201,7 +205,9 @@ async function runWeeklyPreview() {
   const anniversaries = await fetchAnniversaries(dates);
 
   // 商品ページ・商品データ・画像を確認できた商品だけを使う(予備も使う直前に確認する)
-  const nextVerified = createVerifiedProductSource(pool, stats);
+  // 承認済み・公開済みの日の商品も、ジャンルの上限に数える(記録のジャンルは古い判定のことがあるので、商品名から判定し直す)
+  const lockedGenres = [...lockedByDate.values()].map(e => productGenre(String(e.title || ''), e.source?.productType || '', e.source?.tags || []));
+  const nextVerified = createVerifiedProductSource(pool, stats, lockedGenres);
   const primary = [];
   while (primary.length < openDates.length) {
     const p = await nextVerified();
@@ -214,8 +220,8 @@ async function runWeeklyPreview() {
   const avoid = { openings: [...historyPhrases.openings], closings: [...historyPhrases.closings] };
   const results = new Map();
   let outageStreak = 0;
-  let lastDailyQuota = false;
-  for (const date of openDates) {
+  let stopReason = '';
+  for (const [index, date] of openDates.entries()) {
     const a = assignments.find(x => x.date === date);
     if (!a) {
       results.set(date, { date, failed: true, error: '確認できた候補商品が足りませんでした' });
@@ -224,21 +230,25 @@ async function runWeeklyPreview() {
     if (outageStreak >= CONFIG.GEMINI_OUTAGE_SLOTS) {
       // 混雑・通信エラーが続いているときは、残りの日で長く待ち続けない
       nextVerified.release(a.product);
-      results.set(date, { date, failed: true, transient: true, product: a.product, error: lastDailyQuota
+      results.set(date, { date, failed: true, transient: true, product: a.product, error: stopReason === 'daily'
         ? 'Gemini の1日の利用上限に達したため、この日は生成を見送りました(日本時間17時ごろにリセット)'
-        : `Gemini の混雑・通信エラーが${outageStreak}日続いたため、この日は生成を見送りました` });
+        : stopReason === 'budget'
+          ? `この実行の Gemini 呼び出し上限(${CONFIG.GEMINI_CALL_BUDGET}回)に達したため、この日は生成を見送りました`
+          : `Gemini の混雑・通信エラーが${outageStreak}日続いたため、この日は生成を見送りました` });
       continue;
     }
     const anniversary = await resolveAnniversary(date, a, anniversaries[date]);
     const weekPosts = [...results.values()].filter(p => !p.failed);
-    const post = await generateForSlot(apiKey, { date, product: a.product, anniversary, assignReason: a.reason }, nextVerified, avoid, weekPosts);
+    // 残りの日(この日より後)に1回ずつ呼べる分は、作り直し・差し替えに使わない
+    const reserve = openDates.length - index - 1;
+    const post = await generateForSlot(apiKey, { date, product: a.product, anniversary, assignReason: a.reason, reserve }, nextVerified, avoid, weekPosts);
     if (!post.failed) {
       avoid.openings.push(post.opening);
       avoid.closings.push(post.closing);
     }
-    // 1日の上限に達したときは、残りの日もすぐ見送る
-    lastDailyQuota = Boolean(post.dailyQuota);
-    outageStreak = post.failed && post.transient ? (post.dailyQuota ? CONFIG.GEMINI_OUTAGE_SLOTS : outageStreak + 1) : 0;
+    // 1日の上限・この実行の呼び出し上限に達したときは、残りの日もすぐ見送る
+    stopReason = post.dailyQuota ? 'daily' : post.budget ? 'budget' : '';
+    outageStreak = post.failed && post.transient ? (stopReason ? CONFIG.GEMINI_OUTAGE_SLOTS : outageStreak + 1) : 0;
     results.set(date, post);
   }
   // 7件そろってから、見出し・最後の一文・構成・切り口の似すぎを確かめ、似すぎた投稿を書き直す
@@ -246,6 +256,9 @@ async function runWeeklyPreview() {
   for (const [date, entry] of lockedByDate) results.set(date, { date, locked: true, entry });
 
   const posts = dates.map(d => results.get(d));
+  for (const p of posts) {
+    p.rejectedEntries = history.entries.filter(e => e.status === 'rejected' && e.week === weekStart && e.postDate === p.date);
+  }
   const recorded = updateHistory(history, weekStart, dates, posts);
   if (recorded !== null) saveHistory(history);
 
@@ -416,9 +429,10 @@ function productGenre(title, productType, tags) {
  * - 確認できなかった商品は stats.verifyFailures に理由と一緒に残し、MAX_VERIFY_FAILURES 件で打ち切る
  * nextVerified.release(product) で、使わなかった商品のジャンルの枠を戻す。
  */
-function createVerifiedProductSource(pool, stats) {
+function createVerifiedProductSource(pool, stats, lockedGenres = []) {
   let index = 0;
   const genreCount = new Map();
+  for (const g of lockedGenres) genreCount.set(g, (genreCount.get(g) || 0) + 1);
   const deferred = [];
   stats.verifyFailures = [];
   stats.genreDeferred = [];
@@ -794,7 +808,12 @@ async function generateForSlotInner(apiKey, slot, nextVerified, avoid, weekPosts
   let lastError = null;
   let transient = false;
   let dailyQuota = false;
+  let budget = false;
   for (let s = 0; s <= CONFIG.MAX_PRODUCT_SWITCHES; s++) {
+    if (s > 0 && geminiBudgetLeft() <= (slot.reserve || 0)) {
+      log(`${slot.date}: Gemini の呼び出しを節約するため、予備の商品への差し替えはしません`);
+      break;
+    }
     const product = s === 0 ? slot.product : await nextVerified();
     if (!product) break;
     tried.push(product);
@@ -804,6 +823,10 @@ async function generateForSlotInner(apiKey, slot, nextVerified, avoid, weekPosts
     let feedback = '';
     let errored = false;
     for (let attempt = 1; attempt <= CONFIG.GEMINI_MAX_ATTEMPTS; attempt++) {
+      if (attempt > 1 && geminiBudgetLeft() <= (slot.reserve || 0)) {
+        log(`${slot.date} ${product.title}: Gemini の呼び出しを節約するため、作り直しはしません`);
+        break;
+      }
       let data;
       let model;
       try {
@@ -812,6 +835,7 @@ async function generateForSlotInner(apiKey, slot, nextVerified, avoid, weekPosts
         lastError = e.message;
         transient = Boolean(e.transient);
         dailyQuota = Boolean(e.dailyQuota);
+        budget = Boolean(e.budget);
         errored = true;
         break;
       }
@@ -828,18 +852,19 @@ async function generateForSlotInner(apiKey, slot, nextVerified, avoid, weekPosts
     if (bestStyle) return bestStyle;
     if (errored && !best) {
       // Gemini 自体のエラーは商品を替えても直らないことが多いので、この日は失敗にする
-      return { date: slot.date, failed: true, transient, dailyQuota, error: `Gemini APIエラー: ${lastError}`, product, replaced };
+      return { date: slot.date, failed: true, transient, dailyQuota, budget, error: `Gemini APIエラー: ${lastError}`, product, replaced };
     }
     replaced.push({ title: product.title, reason: errored ? 'Gemini APIエラー' : 'ルール・事実確認を満たせなかった' });
   }
   if (best) return { ...best, ok: false, needsReview: true, replaced };
-  return { date: slot.date, failed: true, transient, dailyQuota, error: lastError ? `Gemini APIエラー: ${lastError}` : '確認できた候補商品が足りませんでした', replaced };
+  return { date: slot.date, failed: true, transient, dailyQuota, budget, error: lastError ? `Gemini APIエラー: ${lastError}` : '確認できた候補商品が足りませんでした', replaced };
 }
 
 /** 失敗・要確認の理由を、プレビュー向けの短い説明にする */
 function describeProblem(p) {
   if (p.failed) {
     const e = String(p.error || '');
+    if (/呼び出し上限/.test(e)) return { title: `この実行の Gemini 呼び出し上限(${CONFIG.GEMINI_CALL_BUDGET}回)に達したため生成できませんでした`, detail: e };
     if (/1日の(利用)?上限/.test(e)) return { title: 'Gemini の1日の利用上限に達したため生成できませんでした', detail: e };
     if (/見送りました/.test(e)) return { title: 'Gemini の障害が続いたため生成を見送りました', detail: e };
     if (/応答がありませんでした|fetch failed/.test(e) && !/503|UNAVAILABLE/.test(e)) return { title: 'Gemini との通信エラーで生成できませんでした', detail: e };
@@ -869,6 +894,10 @@ async function reviewWeek(apiKey, slotPosts, historyPhrases, results) {
   const rewritten = [];
   const targets = [...before.keys()].slice(0, CONFIG.WEEK_REWRITE_LIMIT);
   for (const date of targets) {
+    if (geminiBudgetLeft() <= 0) {
+      log(`${date}: Gemini の呼び出しを節約するため、類似の書き直しはしません(注意として表示します)`);
+      continue;
+    }
     const post = results.get(date);
     const reasons = before.get(date);
     const others = usable().filter(p => p.date !== date);
@@ -1145,11 +1174,9 @@ function evaluatePost(data, date, product, anniversary, avoid) {
     factIssues.push(`根拠が商品情報に見つかりません: 「${c.text || c.evidence}」`);
   }
   const [, mm, dd] = date.split('-').map(Number);
-  const numberSource = [productSourceText(product), anniversary?.name || '', anniversary?.description || '', `${mm}月${dd}日`].join('\n').normalize('NFKC');
-  for (const n of new Set(body.normalize('NFKC').match(/\d+(?:\.\d+)?/g) || [])) {
-    const re = new RegExp(`(^|[^0-9.])${n.replace('.', '\\.')}($|[^0-9])`);
-    if (!re.test(numberSource)) factIssues.push(`商品情報にない数字が本文にあります: ${n}`);
-  }
+  // 単位つきの数字(3年・5kg など)は「数字+単位」で照合する(承認管理の修正チェックと同じ)
+  const numberSource = [productSourceText(product), anniversary?.name || '', anniversary?.description || '', `${mm}月${dd}日`].join('\n');
+  for (const n of unsupportedNumbers(body, numberSource)) factIssues.push(`商品情報にない数字が本文にあります: ${n}`);
 
   // 記念日
   const anniversaryUsed = Boolean(anniversary) && String(data.anniversary_used) === 'true';
@@ -1173,6 +1200,11 @@ function evaluatePost(data, date, product, anniversary, avoid) {
 /** Gemini の呼び出し状況(プレビューと実行結果に表示する。APIキーなどの秘密は含めない) */
 const geminiUsage = { calls: 0, byModel: {}, rateLimits: [], dailyExhausted: [] };
 const geminiLastCallAt = new Map();
+
+/** この実行であと何回 Gemini を呼べるか(1日の上限を使い切らないための、実行ごとの上限) */
+function geminiBudgetLeft() {
+  return CONFIG.GEMINI_CALL_BUDGET - geminiUsage.calls;
+}
 
 function countGemini(model, key) {
   geminiUsage.byModel[model] ??= { calls: 0, ok: 0, rateLimited: 0, unavailable: 0, timeout: 0, networkError: 0, badOutput: 0 };
@@ -1216,6 +1248,9 @@ async function callGeminiJson(apiKey, prompt) {
     for (const model of usable) {
       for (let sameModelTry = 0; sameModelTry < 2; sameModelTry++) {
         if (geminiUsage.dailyExhausted.includes(model)) break;
+        if (geminiBudgetLeft() <= 0) {
+          throw Object.assign(new Error(`この実行の Gemini 呼び出し上限(${CONFIG.GEMINI_CALL_BUDGET}回)に達しました`), { transient: true, budget: true });
+        }
         const readyAt = (geminiLastCallAt.get(model) || 0) + CONFIG.GEMINI_MIN_INTERVAL_MS;
         while (Date.now() < readyAt) await sleep(readyAt - Date.now());
         geminiLastCallAt.set(model, Date.now());
@@ -1379,13 +1414,15 @@ function saveHistory(history) {
 
 /**
  * 投稿予定日の前後 REUSE_BLOCK_DAYS 日に選ばれている商品ID。
- * 作り直す週(と同じ日付)の「候補」は置き換えるので含めない。
+ * - 作り直す週(と同じ日付)の「候補」は置き換えるので含めない
+ * - 「不採用」は、その週の作り直しでだけ選ばない(翌週以降は候補に戻す)
  */
 function blockedProductIds(history, weekStart, dates) {
   const from = addDays(dates[0], -CONFIG.REUSE_BLOCK_DAYS);
   const to = addDays(dates.at(-1), CONFIG.REUSE_BLOCK_DAYS);
   return new Set(history.entries
     .filter(e => !isReplacedCandidate(e, weekStart, dates))
+    .filter(e => e.status !== 'rejected' || e.week === weekStart)
     .filter(e => e.postDate >= from && e.postDate <= to)
     .map(e => String(e.productId)));
 }
@@ -1405,7 +1442,11 @@ function updateHistory(history, weekStart, dates, posts) {
   history.entries = history.entries.filter(e => !isReplacedCandidate(e, weekStart, dates));
   let recorded = 0;
   for (const p of succeeded) {
-    history.entries.push({
+    const source = {
+      title: p.product.title, vendor: p.product.vendor, productType: p.product.productType,
+      tags: p.product.tags, description: p.product.description
+    };
+    const entry = {
       productId: p.product.id,
       handle: p.product.handle,
       title: p.product.title,
@@ -1417,8 +1458,17 @@ function updateHistory(history, weekStart, dates, posts) {
       factCheck: 'passed', // 事実確認に通った投稿だけを記録する(承認できるのはこの記録だけ)
       opening: p.opening,
       closing: p.closing,
-      generatedAt: now
-    });
+      generatedAt: now,
+      // 承認管理(承認・修正・不採用)で使う。修正の事実確認は source と照合する
+      message: p.message,
+      originalHash: hashOf(p.message),
+      url: p.product.url,
+      images: p.product.images,
+      source,
+      sourceHash: hashOf(source)
+    };
+    history.entries.push(entry);
+    p.reviewRecord = reviewRecordFromEntry(entry);
     recorded++;
   }
   history.entries.sort((a, b) => a.postDate.localeCompare(b.postDate) || String(a.productId).localeCompare(String(b.productId)));
@@ -1467,6 +1517,11 @@ function completeness(posts) {
 }
 
 function renderWeeklyHtml({ weekStart, dates, posts, stats, anniversaries, assignmentNote, recorded, weekReview }) {
+  // 承認管理: 今回「候補」として記録した投稿だけを判断の対象にする(履歴を変えなかった実行では表示しない)
+  const records = posts.map(p => p.reviewRecord).filter(Boolean);
+  const review = records.length
+    ? reviewAssets({ week: weekStart, dataSource: CONFIG.DATA_SOURCE, pageId: `preview-${records[0].generatedAt}`, records })
+    : null;
   const reviewRows = posts.filter(p => !p.locked && !p.failed).map(p => `
       <tr>
         <td><a href="#d-${p.date}">${esc(formatDateJa(p.date))}</a></td>
@@ -1537,6 +1592,8 @@ function renderWeeklyHtml({ weekStart, dates, posts, stats, anniversaries, assig
   .copy-btn:hover { filter:brightness(1.08); }
   .copy-btn:focus-visible { outline:3px solid var(--warn-line); outline-offset:2px; }
   .copy-btn.warn { background:transparent; color:var(--ng); border-color:var(--ng); }
+  .warn { color:#a15c00; }
+  ${review ? review.css : ''}
   .photos { display:grid; gap:2px; }
   .photos.n2 { grid-template-columns:minmax(0,1fr) minmax(0,1fr); }
   .photos img { display:block; width:100%; min-width:0; aspect-ratio:1/1; object-fit:cover; background:var(--line); }
@@ -1578,7 +1635,7 @@ ${done.problems.length ? `
       ? '<span class="ng">生成に成功した投稿がないため、候補履歴は変更していません</span>'
       : `候補履歴に記録: ${recorded}件(${esc(CONFIG.HISTORY_FILE)}、週 ${esc(weekStart)})`}${assignmentNote ? `<br><span class="ng">${esc(assignmentNote)}</span>` : ''}</p>
   </section>
-
+${review ? reviewBar() : ''}
   <section class="panel">
     <h2>週全体の類似チェック</h2>
     <p class="meta">見出し・最後の一文の言い回し(商品名を除く)、文末、構成(H=見出し、数字=各段落の文の数)、見出しの形(絵文字・「」の位置)、切り口を7件で比べています。
@@ -1609,6 +1666,7 @@ ${done.problems.length ? `
   ${posts.map(p => renderSlot(p, anniversaries[p.date])).join('\n')}
 </main>
 <script>${COPY_SCRIPT}</script>
+${review ? review.data + review.script : ''}
 </body>
 </html>
 `;
@@ -1617,14 +1675,20 @@ ${done.problems.length ? `
 function renderSlot(p, day) {
   const heading = `<h2>${esc(formatDateJa(p.date))}</h2>${IS_MOCK ? `<div class="mock-card">${MOCK_LABEL}</div>` : ''}`;
   if (p.locked) {
+    const e = p.entry;
+    const images = (e.images || []).map(src => `<img src="${esc(src)}" alt="${esc(e.title)}" loading="lazy">`).join('');
     return `<section class="panel" id="d-${p.date}">${heading}
-      <div class="badges"><span class="badge">${esc(STATUS_LABELS[p.entry.status])}</span></div>
-      <p>${esc(p.entry.title)}</p>
+      <div class="badges"><span class="badge">${esc(STATUS_LABELS[e.status])}</span>${e.edited ? '<span class="badge">修正して承認</span>' : ''}</div>
+      <p>${esc(e.title)}</p>
+      ${e.message ? `<div class="post"><div class="message">${renderMessageHtml(e.message, e.url)}</div>${images ? `<div class="photos n${(e.images || []).length}">${images}</div>` : ''}</div>
+      <div class="copy-row"><button type="button" class="copy-btn">投稿文をコピー</button><span class="copy-status meta" role="status" aria-live="polite"></span>
+      <textarea class="copy-src" readonly hidden>${esc(e.message)}</textarea></div>` : ''}
       <p class="meta">承認済み・公開済みの日は作り直しません。</p></section>`;
   }
+  const rejectedNote = (p.rejectedEntries || []).map(e => `<p class="meta">この日は「${esc(e.title)}」を不採用にしています(理由: ${esc(e.decision?.reason || '')}${e.decision?.note ? ` / ${esc(e.decision.note)}` : ''})。同じ週では選びません。</p>`).join('');
   if (p.failed) {
     const why = describeProblem(p);
-    return `<section class="panel" id="d-${p.date}">${heading}
+    return `<section class="panel" id="d-${p.date}">${heading}${rejectedNote}
       <div class="badges"><span class="badge ng">エラー・投稿案なし(履歴に記録しない)</span></div>
       <p class="ng">${esc(why.title)}</p>
       ${p.product ? `<p>予定していた商品: ${esc(p.product.title)}${p.product.genre ? `[${esc(p.product.genre)}]` : ''}</p>` : ''}
@@ -1676,6 +1740,8 @@ function renderSlot(p, day) {
       <span class="copy-status meta" role="status" aria-live="polite"></span>
       <textarea class="copy-src" readonly hidden>${esc(p.message)}</textarea>`}
     </div>
+    ${rejectedNote}
+    ${p.reviewRecord ? reviewWidget(p.reviewRecord) : '<p class="meta">履歴に記録していないため、判断(承認・修正・不採用)の対象外です。</p>'}
 
     <h3>チェック</h3>
     <table class="kv">
@@ -1818,8 +1884,9 @@ function sleep(ms) {
 // ---------------------------------------------------------------------------
 
 /**
- * Gemini APIのモデル一覧からFlash系を抜き出し、それぞれ短い generateContent を1回呼んで
- * 実際に使えるかを確かめる(一覧に載っていても新規キーでは使えないモデルがあるため)。
+ * Gemini API のモデル一覧(Flash 系)を表示する。一覧の取得は生成の回数に数えられないため、既定では生成の呼び出しはしない。
+ * MODELS_PROBE=モデル名,モデル名 を指定したときだけ、そのモデルに短い generateContent を1回ずつ呼んで使えるか確かめる
+ * (1日の上限を消費するため、必要なモデルだけに絞る)。
  */
 async function checkGeminiModels() {
   const apiKey = requireEnv('GEMINI_API_KEY');
@@ -1837,24 +1904,30 @@ async function checkGeminiModels() {
   } while (pageToken);
 
   const flash = models.filter(m => /flash/i.test(m.name) && (m.supportedGenerationMethods || []).includes('generateContent'));
-  const targets = [...new Set([...flash.map(m => m.name.replace(/^models\//, '')), ...CONFIG.GEMINI_MODELS])];
+  const probe = String(process.env.MODELS_PROBE || '').split(',').map(s => s.trim()).filter(Boolean).slice(0, 3);
+  const names = [...new Set([...flash.map(m => m.name.replace(/^models\//, '')), ...CONFIG.GEMINI_MODELS])];
 
   const rows = [];
-  for (const name of targets) {
+  for (const name of names) {
     const listed = flash.some(m => m.name === `models/${name}`);
-    const res = await fetch(`${base}/models/${name}:generateContent`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ contents: [{ parts: [{ text: 'OKとだけ答えてください。' }] }] })
-    });
-    const json = await res.json();
-    const result = json.error ? `× ${json.error.code} ${json.error.status}: ${String(json.error.message).slice(0, 120)}` : '○ 呼び出し成功';
-    rows.push(`| ${name} | ${listed ? 'あり' : 'なし'} | ${result} |`);
+    let result = '(呼び出していません)';
+    if (probe.includes(name)) {
+      const res = await fetch(`${base}/models/${name}:generateContent`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ contents: [{ parts: [{ text: 'OKとだけ答えてください。' }] }] }),
+        signal: AbortSignal.timeout(CONFIG.GEMINI_TIMEOUT_MS)
+      });
+      const json = await res.json();
+      result = json.error ? `× ${json.error.code} ${json.error.status}: ${String(json.error.message).slice(0, 120)}` : '○ 呼び出し成功';
+    }
+    rows.push(`| ${name}${CONFIG.GEMINI_MODELS.includes(name) ? '(使用中)' : ''} | ${listed ? 'あり' : 'なし'} | ${result} |`);
   }
 
   summary([
     `### Gemini モデル確認(全${models.length}件中、generateContent 対応の Flash 系 ${flash.length}件)`,
     `現在のコードの設定(上から順に使用): ${CONFIG.GEMINI_MODELS.join(' → ')}`,
+    probe.length ? `呼び出して確かめたモデル: ${probe.join(', ')}(1日の上限を1回ずつ消費)` : '生成の呼び出しはしていません(確かめるときは MODELS_PROBE=モデル名 を指定。最大3つ)',
     '',
     '| モデル | 一覧に掲載 | 実際の呼び出し |',
     '|---|---|---|',
