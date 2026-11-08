@@ -49,7 +49,7 @@
       "title": "シャインマスカット＆BKシードレス 2種食べ比べセット",
       "postDate": "2026-11-16",
       "week": "2026-11-16",
-      "status": "candidate",
+      "status": "approved",
       "dataSource": "live",
       "genre": "果物",
       "factCheck": "passed",
@@ -75,6 +75,11 @@
         "file": "fb-week-2026-11-16.html",
         "at": "2026-11-08T21:23:32.777Z",
         "note": "候補を作ったときのプレビューHTMLから補完(販売者・種別・タグは含まない)"
+      },
+      "decision": {
+        "action": "approve",
+        "decidedAt": "2026-11-08T21:36:39.373Z",
+        "decisionFile": "fb-decisions-2026-11-16-rev2.json"
       }
     },
     {
@@ -83,14 +88,14 @@
       "title": "【期間限定】会津みしらず柿（大）5kg",
       "postDate": "2026-11-17",
       "week": "2026-11-16",
-      "status": "candidate",
+      "status": "approved",
       "dataSource": "live",
       "genre": "果物",
       "factCheck": "passed",
       "opening": "日に日に変わる食感を楽しむ「会津みしらず柿」",
       "closing": "さらに熟して柔らかくなった柿を冷凍庫で凍らせれば、お風呂上がりのシャーベットとしても楽しめます。",
       "generatedAt": "2026-11-08T15:38:31.648Z",
-      "message": "日に日に変わる食感を楽しむ「会津みしらず柿」\n\n収穫後に約2週間かけてアルコールでじっくり渋抜きをした柿は、とろけるような甘みとたっぷりの果汁が魅力です。\n\n開封してすぐはシャッキリと固め、日がたつにつれて徐々に柔らかくねっとりとした歯触りに変わります。さらに熟して柔らかくなった柿を冷凍庫で凍らせれば、お風呂上がりのシャーベットとしても楽しめます。\n\n▼詳細はこちら\nhttps://fukushima-ichiba.com/products/n294a16\n\n#ふくしま市場 #福島県 #会津みしらず柿 #柿",
+      "message": "日に日に変わる食感を楽しむ「会津みしらず柿」\n\n収穫後に約2週間かけてアルコールでじっくり渋抜きをした柿は、とろけるような甘みとたっぷりの果汁が魅力です。\n\n開封してすぐはシャッキリと固め、日がたつにつれて徐々に柔らかくねっとりとした歯触りに変わります。\n\n▼詳細はこちら\nhttps://fukushima-ichiba.com/products/n294a16\n\n#ふくしま市場 #福島県 #会津みしらず柿 #柿",
       "originalHash": "bafbf95ddfb80fa2",
       "source": {
         "title": "【期間限定】会津みしらず柿（大）5kg",
@@ -109,6 +114,15 @@
         "file": "fb-week-2026-11-16.html",
         "at": "2026-11-08T21:23:32.778Z",
         "note": "候補を作ったときのプレビューHTMLから補完(販売者・種別・タグは含まない)"
+      },
+      "generatedMessage": "日に日に変わる食感を楽しむ「会津みしらず柿」\n\n収穫後に約2週間かけてアルコールでじっくり渋抜きをした柿は、とろけるような甘みとたっぷりの果汁が魅力です。\n\n開封してすぐはシャッキリと固め、日がたつにつれて徐々に柔らかくねっとりとした歯触りに変わります。さらに熟して柔らかくなった柿を冷凍庫で凍らせれば、お風呂上がりのシャーベットとしても楽しめます。\n\n▼詳細はこちら\nhttps://fukushima-ichiba.com/products/n294a16\n\n#ふくしま市場 #福島県 #会津みしらず柿 #柿",
+      "edited": true,
+      "decision": {
+        "action": "edit",
+        "decidedAt": "2026-11-08T21:36:39.373Z",
+        "decisionFile": "fb-decisions-2026-11-16-rev2.json",
+        "confirmNoNewFacts": true,
+        "warnings": []
       }
     },
     {
@@ -117,7 +131,7 @@
       "title": "雪小町 にごり酒 雪丸",
       "postDate": "2026-11-18",
       "week": "2026-11-16",
-      "status": "candidate",
+      "status": "approved",
       "dataSource": "live",
       "genre": "飲料・お酒",
       "factCheck": "passed",
@@ -142,6 +156,11 @@
         "file": "fb-week-2026-11-16.html",
         "at": "2026-11-08T21:23:32.778Z",
         "note": "候補を作ったときのプレビューHTMLから補完(販売者・種別・タグは含まない)"
+      },
+      "decision": {
+        "action": "approve",
+        "decidedAt": "2026-11-08T21:36:39.373Z",
+        "decisionFile": "fb-decisions-2026-11-16-rev2.json"
       }
     },
     {
@@ -150,14 +169,14 @@
       "title": "予約　【令和8年産】 こだわりの奥会津只見産コシヒカリ10kg（5kg×2）　-11月出荷予定",
       "postDate": "2026-11-19",
       "week": "2026-11-16",
-      "status": "candidate",
+      "status": "approved",
       "dataSource": "live",
       "genre": "お米",
       "factCheck": "passed",
       "opening": "尾瀬の澄んだ水と自然の恵みで育つ奥会津只見産コシヒカリ",
       "closing": "ふっくらとした炊き上がりで強い粘りがあり、噛めば噛むほどお米本来の甘みが広がります。",
       "generatedAt": "2026-11-08T15:38:31.648Z",
-      "message": "尾瀬の澄んだ水と自然の恵みで育つ奥会津只見産コシヒカリ\n\n魚沼のとなりに位置する奥会津只見町は、日本有数の米どころ。米屋商店が契約農家とともに安心・安全を追求して育てた、ブレンドなしの100％只見産単一原料米です。\n\nふっくらとした炊き上がりで強い粘りがあり、噛めば噛むほどお米本来の甘みが広がります。\n\n▼詳細はこちら\nhttps://fukushima-ichiba.com/products/n13711\n\n#ふくしま市場 #福島県 #奥会津 #コシヒカリ",
+      "message": "尾瀬の澄んだ水と自然の恵みで育つ奥会津只見産コシヒカリ\n\nふっくらとした炊き上がりで強い粘りがあり、噛めば噛むほどお米本来の甘みが広がります。\n\n▼詳細はこちら\nhttps://fukushima-ichiba.com/products/n13711\n\n#ふくしま市場 #福島県 #奥会津 #コシヒカリ",
       "originalHash": "499ccc7fec2ef233",
       "source": {
         "title": "予約　【令和8年産】 こだわりの奥会津只見産コシヒカリ10kg（5kg×2）　-11月出荷予定",
@@ -176,6 +195,15 @@
         "file": "fb-week-2026-11-16.html",
         "at": "2026-11-08T21:23:32.778Z",
         "note": "候補を作ったときのプレビューHTMLから補完(販売者・種別・タグは含まない)"
+      },
+      "generatedMessage": "尾瀬の澄んだ水と自然の恵みで育つ奥会津只見産コシヒカリ\n\n魚沼のとなりに位置する奥会津只見町は、日本有数の米どころ。米屋商店が契約農家とともに安心・安全を追求して育てた、ブレンドなしの100％只見産単一原料米です。\n\nふっくらとした炊き上がりで強い粘りがあり、噛めば噛むほどお米本来の甘みが広がります。\n\n▼詳細はこちら\nhttps://fukushima-ichiba.com/products/n13711\n\n#ふくしま市場 #福島県 #奥会津 #コシヒカリ",
+      "edited": true,
+      "decision": {
+        "action": "edit",
+        "decidedAt": "2026-11-08T21:36:39.373Z",
+        "decisionFile": "fb-decisions-2026-11-16-rev2.json",
+        "confirmNoNewFacts": true,
+        "warnings": []
       }
     },
     {
@@ -184,14 +212,14 @@
       "title": "ゆいプリンリッチ6個入り",
       "postDate": "2026-11-20",
       "week": "2026-11-16",
-      "status": "candidate",
+      "status": "approved",
       "dataSource": "live",
       "genre": "お菓子・スイーツ",
       "factCheck": "passed",
       "opening": "都路産の卵黄と生クリームを贅沢に使った「ゆいプリンリッチ」",
       "closing": "カラメルソースは別添えになっているため、好みのタイミングでかけて味わえます。",
       "generatedAt": "2026-11-08T15:38:31.648Z",
-      "message": "都路産の卵黄と生クリームを贅沢に使った「ゆいプリンリッチ」\n\nみやこじスイーツゆいで人気ナンバーワンのプリンです。\n\n都路産の卵の卵黄と生クリームをたっぷり使い、滑らかな食感に仕上げました。カラメルソースは別添えになっているため、好みのタイミングでかけて味わえます。\n\n▼詳細はこちら\nhttps://fukushima-ichiba.com/products/c389a01\n\n#ふくしま市場 #福島県 #田村市 #洋菓子",
+      "message": "都路産の卵黄と生クリームを贅沢に使った「ゆいプリンリッチ」\n\n都路産の卵の卵黄と生クリームをたっぷり使い、滑らかな食感に仕上げました。カラメルソースは別添えなので、お好みのタイミングでかけてお楽しみいただけます。\n\n▼詳細はこちら\nhttps://fukushima-ichiba.com/products/c389a01\n\n#ふくしま市場 #福島県 #田村市 #洋菓子",
       "originalHash": "eee91032e72bf217",
       "source": {
         "title": "ゆいプリンリッチ6個入り",
@@ -210,6 +238,15 @@
         "file": "fb-week-2026-11-16.html",
         "at": "2026-11-08T21:23:32.779Z",
         "note": "候補を作ったときのプレビューHTMLから補完(販売者・種別・タグは含まない)"
+      },
+      "generatedMessage": "都路産の卵黄と生クリームを贅沢に使った「ゆいプリンリッチ」\n\nみやこじスイーツゆいで人気ナンバーワンのプリンです。\n\n都路産の卵の卵黄と生クリームをたっぷり使い、滑らかな食感に仕上げました。カラメルソースは別添えになっているため、好みのタイミングでかけて味わえます。\n\n▼詳細はこちら\nhttps://fukushima-ichiba.com/products/c389a01\n\n#ふくしま市場 #福島県 #田村市 #洋菓子",
+      "edited": true,
+      "decision": {
+        "action": "edit",
+        "decidedAt": "2026-11-08T21:36:39.373Z",
+        "decisionFile": "fb-decisions-2026-11-16-rev2.json",
+        "confirmNoNewFacts": true,
+        "warnings": []
       }
     },
     {
@@ -218,14 +255,14 @@
       "title": "白河メンチ 白河高原清流豚100％・肉屋の人気メンチカツ",
       "postDate": "2026-11-21",
       "week": "2026-11-16",
-      "status": "candidate",
+      "status": "approved",
       "dataSource": "live",
       "genre": "肉・魚",
       "factCheck": "passed",
       "opening": "肉も油も白河高原清流豚を使った老舗肉屋の白河メンチ",
       "closing": "忙しい日の夕食や贅沢なおつまみにも重宝します。",
       "generatedAt": "2026-11-08T15:38:31.648Z",
-      "message": "肉も油も白河高原清流豚を使った老舗肉屋の白河メンチ\n\n福島県白河市の老舗「肉の秋元本店」で一番人気の惣菜です。\n\n粗挽きの肉と背脂だけでなく、揚げ油にまで清流豚の背脂を使うこだわり。レンジやトースターで温めるだけで、外はサクッ、中はふんわりジューシーな旨みが広がります。忙しい日の夕食や贅沢なおつまみにも重宝します。\n\n▼詳細はこちら\nhttps://fukushima-ichiba.com/products/b383a02\n\n#ふくしま市場 #福島県 #白河メンチ #メンチカツ",
+      "message": "肉も油も白河高原清流豚を使った老舗肉屋の白河メンチ\n\n福島県白河市の老舗「肉の秋元本店」で一番人気。\n\n粗挽きの肉と背脂だけでなく、揚げ油にまで清流豚の背脂を使うこだわり。レンジやトースターで温めるだけで、外はサクッ、中はふんわりジューシーな旨みが広がります。\n\n▼詳細はこちら\nhttps://fukushima-ichiba.com/products/b383a02\n\n#ふくしま市場 #福島県 #白河メンチ #メンチカツ",
       "originalHash": "cf389cd3e0534622",
       "source": {
         "title": "白河メンチ 白河高原清流豚100％・肉屋の人気メンチカツ",
@@ -244,6 +281,15 @@
         "file": "fb-week-2026-11-16.html",
         "at": "2026-11-08T21:23:32.779Z",
         "note": "候補を作ったときのプレビューHTMLから補完(販売者・種別・タグは含まない)"
+      },
+      "generatedMessage": "肉も油も白河高原清流豚を使った老舗肉屋の白河メンチ\n\n福島県白河市の老舗「肉の秋元本店」で一番人気の惣菜です。\n\n粗挽きの肉と背脂だけでなく、揚げ油にまで清流豚の背脂を使うこだわり。レンジやトースターで温めるだけで、外はサクッ、中はふんわりジューシーな旨みが広がります。忙しい日の夕食や贅沢なおつまみにも重宝します。\n\n▼詳細はこちら\nhttps://fukushima-ichiba.com/products/b383a02\n\n#ふくしま市場 #福島県 #白河メンチ #メンチカツ",
+      "edited": true,
+      "decision": {
+        "action": "edit",
+        "decidedAt": "2026-11-08T21:36:39.373Z",
+        "decisionFile": "fb-decisions-2026-11-16-rev2.json",
+        "confirmNoNewFacts": true,
+        "warnings": []
       }
     },
     {
@@ -252,7 +298,7 @@
       "title": "【新米予約】令和8年産 福､笑い（2kg・5kg）",
       "postDate": "2026-11-22",
       "week": "2026-11-16",
-      "status": "candidate",
+      "status": "approved",
       "dataSource": "live",
       "genre": "お米",
       "factCheck": "passed",
@@ -278,6 +324,11 @@
         "file": "fb-week-2026-11-16.html",
         "at": "2026-11-08T21:23:32.779Z",
         "note": "候補を作ったときのプレビューHTMLから補完(販売者・種別・タグは含まない)"
+      },
+      "decision": {
+        "action": "approve",
+        "decidedAt": "2026-11-08T21:36:39.373Z",
+        "decisionFile": "fb-decisions-2026-11-16-rev2.json"
       }
     }
   ]
