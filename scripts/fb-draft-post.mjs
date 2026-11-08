@@ -26,7 +26,9 @@ import { dirname, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const CONFIG = {
-  GEMINI_MODEL: process.env.GEMINI_MODEL || 'gemini-2.5-flash',
+  // 先頭から順に使う。2つ目以降は先頭が混雑・上限で使えないときの予備
+  // (2026-11-08 に models モードで、一覧掲載と新APIキーでの呼び出しを確認したモデル)
+  GEMINI_MODELS: process.env.GEMINI_MODEL ? [process.env.GEMINI_MODEL] : ['gemini-3.8-flash', 'gemini-3.7-flash'],
   GRAPH_API_VERSION: 'v26.0',
   // draft で書き込みを許可する唯一のページ(ふくしま市場)
   APPROVED_PAGE_ID: '277404605612561',
@@ -135,7 +137,7 @@ async function runPreview() {
     `- 商品: ${product.title}(${product.price}円)`,
     `- 商品ページ: ${productUrl}`,
     `- 画像: ${product.images.join(' , ') || '(なし)'}`,
-    `- 本文: ${draft.bodyChars}文字 / 絵文字${draft.emojiCount}個`,
+    `- 本文: ${draft.bodyChars}文字 / 絵文字${draft.emojiCount}個(Geminiモデル: ${draft.model})`,
     ...draft.warnings.map(w => `- ⚠ ${w}`),
     '',
     '```',
@@ -234,6 +236,7 @@ function renderPreviewHtml({ draft, product, productUrl, candidateCount }) {
   <table>
     <tr><th>本文の文字数<br>(URL・ハッシュタグ・改行を除く)</th><td class="${rangeOk ? 'ok' : 'ng'}">${draft.bodyChars}文字(目安 ${CONFIG.BODY_MIN_CHARS}〜${CONFIG.BODY_MAX_CHARS})</td></tr>
     <tr><th>絵文字</th><td class="${draft.emojiCount <= CONFIG.MAX_EMOJI ? 'ok' : 'ng'}">${draft.emojiCount}個(上限 ${CONFIG.MAX_EMOJI})</td></tr>
+    <tr><th>Geminiモデル</th><td>${esc(draft.model)}</td></tr>
     <tr><th>記念日</th><td>${esc(describeAnniversary(draft))}${draft.anniversary_reason ? `<br><span class="meta">${esc(draft.anniversary_reason)}</span>` : ''}</td></tr>
     <tr><th>注意</th><td class="${draft.warnings.length ? 'ng' : 'ok'}">${draft.warnings.length ? draft.warnings.map(esc).join('<br>') : 'なし'}</td></tr>
   </table>
@@ -511,7 +514,7 @@ async function checkGeminiModels() {
   } while (pageToken);
 
   const flash = models.filter(m => /flash/i.test(m.name) && (m.supportedGenerationMethods || []).includes('generateContent'));
-  const targets = [...new Set([...flash.map(m => m.name.replace(/^models\//, '')), 'gemini-3.8-flash', CONFIG.GEMINI_MODEL])];
+  const targets = [...new Set([...flash.map(m => m.name.replace(/^models\//, '')), ...CONFIG.GEMINI_MODELS])];
 
   const rows = [];
   for (const name of targets) {
@@ -528,7 +531,7 @@ async function checkGeminiModels() {
 
   summary([
     `### Gemini モデル確認(全${models.length}件中、generateContent 対応の Flash 系 ${flash.length}件)`,
-    `現在のコードの既定: ${CONFIG.GEMINI_MODEL}`,
+    `現在のコードの設定(上から順に使用): ${CONFIG.GEMINI_MODELS.join(' → ')}`,
     '',
     '| モデル | 一覧に掲載 | 実際の呼び出し |',
     '|---|---|---|',
@@ -536,18 +539,28 @@ async function checkGeminiModels() {
   ].join('\n'));
 }
 
+/**
+ * GEMINI_MODELS を先頭から試す。混雑(503)や上限(429)のときだけ次のモデルに切り替え、
+ * それ以外のエラーはそのまま止める。
+ */
 async function callGemini(apiKey, prompt) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${CONFIG.GEMINI_MODEL}:generateContent`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { responseMimeType: 'application/json', temperature: 1.0 }
-    })
-  });
-  const json = await res.json();
-  if (json.error) throw new Error('Gemini APIエラー: ' + JSON.stringify(json.error));
+  let json;
+  let model;
+  for (model of CONFIG.GEMINI_MODELS) {
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { responseMimeType: 'application/json', temperature: 1.0 }
+      })
+    });
+    json = await res.json();
+    const transient = json.error && ['UNAVAILABLE', 'RESOURCE_EXHAUSTED'].includes(json.error.status);
+    if (!transient) break;
+    log(`Gemini ${model} が一時的に使えないため次のモデルを試します: ${json.error.code} ${json.error.status}`);
+  }
+  if (json.error) throw new Error(`Gemini APIエラー(${model}): ` + JSON.stringify(json.error));
 
   const rawText = json.candidates?.[0]?.content?.parts?.[0]?.text || '';
   const cleaned = rawText.trim().replace(/^```(json)?/i, '').replace(/```$/, '').trim();
@@ -560,6 +573,7 @@ async function callGemini(apiKey, prompt) {
   if (!draft.body || !draft.product_handle) {
     throw new Error('Geminiの出力に必要な項目(body / product_handle)がありません: ' + rawText);
   }
+  draft.model = model;
   return draft;
 }
 
