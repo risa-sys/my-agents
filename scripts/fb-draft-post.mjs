@@ -26,8 +26,9 @@ import { pathToFileURL } from 'node:url';
 
 const CONFIG = {
   // 先頭から順に使う。2つ目以降は先頭が混雑・上限・通信エラーで使えないときの予備
-  // (2026-11-08 に models モードで、一覧掲載と新APIキーでの呼び出しを確認したモデル)
-  GEMINI_MODELS: process.env.GEMINI_MODEL ? [process.env.GEMINI_MODEL] : ['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash'],
+  // (2026-11-08 に models モードで、一覧掲載と新APIキーでの呼び出しを確認したモデル。
+  //  2026-11-09 の実データ実行では 3.8 / 3.7 が 429・503・時間切れを繰り返し、7件すべて 3.6 で生成できたため 3.6 を先頭にする)
+  GEMINI_MODELS: process.env.GEMINI_MODEL ? [process.env.GEMINI_MODEL] : ['gemini-3.6-flash', 'gemini-3.8-flash', 'gemini-3.7-flash'],
   GEMINI_TIMEOUT_MS: Number(process.env.GEMINI_TIMEOUT_MS ?? 60000), // 1回の呼び出しの上限時間(応答が無ければ次のモデルへ)
   // すべてのモデルが混雑・通信エラーのとき、この時間だけ待って最初のモデルからやり直す(回数=要素数)
   GEMINI_RETRY_WAITS_MS: String(process.env.GEMINI_RETRY_WAITS_MS ?? '30000,60000').split(',').map(Number),
@@ -49,11 +50,11 @@ const CONFIG = {
   MAX_PER_GENRE: 2,
   // 商品名・種別・タグの言葉でジャンルを決める(上から順に判定。例: 桃ジュース→飲料、米こうじみそ→調味料)
   GENRE_RULES: [
-    ['飲料・お酒', ['日本酒', '純米', '吟醸', '地酒', '清酒', 'ワイン', 'ビール', '焼酎', 'リキュール', 'シードル', 'ジュース', 'サイダー', '飲料', 'コーヒー', '珈琲', '紅茶', '緑茶', 'お茶']],
+    ['飲料・お酒', ['日本酒', '純米', '吟醸', '地酒', '清酒', 'にごり酒', '本醸造', '梅酒', '果実酒', '甘酒', 'どぶろく', 'ワイン', 'ビール', '焼酎', 'リキュール', 'シードル', 'ジュース', 'サイダー', '飲料', 'コーヒー', '珈琲', '紅茶', '緑茶', 'お茶']],
     ['お菓子・スイーツ', ['菓子', 'せんべい', '煎餅', '米菓', 'まんじゅう', '饅頭', '羊羹', 'ようかん', 'ゆべし', 'クッキー', 'ケーキ', 'チョコ', 'プリン', 'ゼリー', 'かりんとう', 'スイーツ', 'ままどおる', '最中', 'もなか']],
     ['調味料・加工品', ['みそ', '味噌', '醤油', 'しょうゆ', 'たれ', 'タレ', 'ドレッシング', 'ジャム', '漬物', '漬け', '佃煮', '缶詰', 'の素', 'つゆ', 'ソース', '干し', '凍み', '惣菜', 'レトルト']],
     ['麺類', ['ラーメン', 'らーめん', 'そば', '蕎麦', 'うどん', '冷麺', '麺']],
-    ['お米', ['お米', '新米', '精米', '玄米', '無洗米', 'コシヒカリ', 'ひとめぼれ', 'ミルキークイーン', '天のつぶ', '里山のつぶ', 'にじのきらめき', '五百川', '福、笑い', 'うるち米', 'もち米']],
+    ['お米', ['お米', '新米', '精米', '玄米', '無洗米', 'コシヒカリ', 'ひとめぼれ', 'ミルキークイーン', '天のつぶ', '里山のつぶ', 'にじのきらめき', '五百川', '福、笑い', 'つや姫', 'ササニシキ', 'あきたこまち', 'うるち米', 'もち米']],
     ['肉・魚', ['牛肉', '豚肉', '鶏肉', '地鶏', '和牛', '牛', '豚', 'ハム', 'ソーセージ', 'ベーコン', '鮭', '鯉', 'うなぎ', '魚', '肉']],
     ['果物', ['柿', 'りんご', '林檎', '桃', 'もも', '梨', 'ぶどう', '葡萄', 'シャインマスカット', 'いちご', '苺', 'さくらんぼ', 'メロン', 'ラ・フランス', '洋梨', 'ブルーベリー', 'フルーツ', '果物']],
     ['野菜・農産物', ['野菜', 'トマト', 'きゅうり', 'アスパラ', 'じゃがいも', 'かぼちゃ', '自然薯', 'きのこ', 'しいたけ', 'なめこ', 'ねぎ', '大豆', '豆', 'にんにく']]
@@ -102,6 +103,8 @@ const CONFIG = {
   SAME_ENDING_LIMIT: 2, // 文末(最後の4文字)が同じ投稿はこの件数まで
   SAME_STRUCTURE_LIMIT: 3, // 段落・文の組み立てが同じ投稿はこの件数まで
   SAME_FOCUS_LIMIT: 2, // 切り口が同じ投稿はこの件数まで
+  SAME_HEADLINE_SHAPE_LIMIT: 3, // 見出しの形(絵文字の有無・「」の位置)が同じ投稿はこの件数まで
+  MAX_EMOJI_HEADLINES: 4, // 絵文字で始まる見出しはこの件数まで(7件中)
   WEEK_REWRITE_LIMIT: 4, // 類似で書き直す投稿の上限(1回の実行あたり)
   WEEK_REWRITE_ATTEMPTS: 2, // 1投稿あたりの書き直し回数
   FIXED_HASHTAGS: ['#ふくしま市場', '#福島県'],
@@ -379,13 +382,21 @@ function normalizeProduct(p) {
   };
 }
 
-/** 商品名・種別・タグの言葉からジャンルを決める(説明文は使わない)。どれにも当たらなければ種別か「その他」 */
+/**
+ * ジャンルを決める(説明文は使わない)。まず商品名だけで判定し、決まらないときだけ種別・タグを見る。
+ * (ストアのタグには「米・麺類」のような複数ジャンルをまとめた分類があり、タグから先に見ると誤判定するため)
+ * どれにも当たらなければ種別か「その他」。
+ */
 function productGenre(title, productType, tags) {
-  const text = norm([title, productType, ...tags].join(' '));
-  for (const [genre, words] of CONFIG.GENRE_RULES) {
-    if (words.some(w => text.includes(norm(w)))) return genre;
-  }
-  return productType ? `その他(${productType})` : 'その他';
+  const match = text => {
+    const t = norm(text);
+    if (!t) return null;
+    for (const [genre, words] of CONFIG.GENRE_RULES) {
+      if (words.some(w => t.includes(norm(w)))) return genre;
+    }
+    return null;
+  };
+  return match(title) || match(productType) || match(tags.join(' ')) || (productType ? `その他(${productType})` : 'その他');
 }
 
 /**
@@ -853,7 +864,9 @@ async function reviewWeek(apiKey, slotPosts, historyPhrases, results) {
       closings: [...historyPhrases.closings, ...others.map(p => p.closing)]
     };
     const prompt = buildPostPrompt(date, post.product, post.anniversary, avoid, others);
-    let feedback = `\n\nこの投稿は、同じ週のほかの投稿と次の点が似ています。見出しの言い回し・構成・切り口・終わり方を変えて書き直してください(事実は商品説明の範囲だけ):\n- ${reasons.join('\n- ')}\n今の本文:\n${post.body}\n`;
+    // 書き直しでも自然さを優先する(違いを出すための不自然な言い回しは使わない。採用されなければ元の投稿を残す)
+    const rewriteRule = '見出しの言い回し・構成・切り口・終わり方を変えて書き直してください。ただし自然で読みやすい文章を優先し、違いを出すためだけの不自然な言い回しや文は使わないでください(事実は商品説明の範囲だけ)。';
+    let feedback = `\n\nこの投稿は、同じ週のほかの投稿と次の点が似ています。${rewriteRule}\n- ${reasons.join('\n- ')}\n今の本文:\n${post.body}\n`;
     let adopted = null;
     for (let attempt = 1; attempt <= CONFIG.WEEK_REWRITE_ATTEMPTS && !adopted; attempt++) {
       let data;
@@ -873,7 +886,7 @@ async function reviewWeek(apiKey, slotPosts, historyPhrases, results) {
         });
       } else {
         const why = [...candidate.issues, ...candidate.factIssues, ...candidate.styleIssues, ...stillSimilar];
-        feedback = `\n\n書き直し案にはまだ次の問題があります。直してください:\n- ${why.join('\n- ')}\n書き直し案:\n${candidate.body}\n`;
+        feedback = `\n\nこの投稿は、同じ週のほかの投稿と似ているため書き直しています。${rewriteRule}\n書き直し案にはまだ次の問題があります:\n- ${why.join('\n- ')}\n書き直し案:\n${candidate.body}\n`;
         log(`${date} 類似の書き直し(${attempt}回目)を採用しませんでした: ${why.join(' / ')}`);
       }
     }
@@ -932,7 +945,25 @@ function findSimilarities(posts) {
     (k, g) => `構成(${k})が${g.length}件で同じ(${g.map(label).join('、')})`);
   overLimit(p => (p.focus && p.focus !== 'その他' ? p.focus : ''), CONFIG.SAME_FOCUS_LIMIT,
     (k, g) => `切り口「${k}」が${g.length}件で同じ(${g.map(label).join('、')})`);
+  overLimit(p => headlineShape(p.opening), CONFIG.SAME_HEADLINE_SHAPE_LIMIT,
+    (k, g) => `見出しの形(${k})が${g.length}件で同じ(${g.map(label).join('、')})`);
+  overLimit(p => (startsWithEmoji(p.opening) ? '絵文字' : ''), CONFIG.MAX_EMOJI_HEADLINES,
+    (k, g) => `絵文字で始まる見出しが${g.length}件(${CONFIG.MAX_EMOJI_HEADLINES}件まで)`);
   return found;
+}
+
+function startsWithEmoji(text) {
+  return /^\s*\p{Extended_Pictographic}/u.test(String(text || ''));
+}
+
+/** 見出しの形: 絵文字で始まるか と 「」の位置(末尾・先頭・文中・なし) */
+function headlineShape(text) {
+  const s = String(text || '').replace(/^\s*[\p{Extended_Pictographic}️‍]+\s*/u, '').replace(/[。!！]+$/, '').trim();
+  let quote = '「」なし';
+  if (/^「[^」]+」/.test(s)) quote = '先頭が「」';
+  else if (/「[^」]+」$/.test(s)) quote = '末尾が「」';
+  else if (/「[^」]+」/.test(s)) quote = '文中に「」';
+  return `${startsWithEmoji(text) ? '絵文字あり' : '絵文字なし'}・${quote}`;
 }
 
 /** 本文の形: 段落ごとの文の数(見出しは H)と、最後の一文 */
@@ -986,7 +1017,11 @@ ${STYLE_REFERENCE}
 - 締めの一文は必須ではない。魅力が伝わっていれば、特徴の説明で終えてよい。
   締める場合は、商品説明に根拠のある具体的な食べ方・使い道で締める
 - 次のような定型表現に頼らない: ${CONFIG.STOCK_PHRASES.join('、')}
-- 見出しは1行(絵文字は0〜1個)で、この商品ならではの言葉にする。「〜のご紹介」「〜が入荷しました」「〇〇の魅力」のような型にしない
+- 見出しは1行で、この商品ならではの言葉にする。「〜のご紹介」「〜が入荷しました」「〇〇の魅力」のような型にしない
+- 見出しの形は商品に合わせて選ぶ。毎回「絵文字+特徴+「商品名」」にしない
+  (例: 商品名から始める/特徴や味わいから始める/食べ方・使い道を伝える/産地や作り手から入る/「」を使わない)
+  形を変えるために不自然な言い回しにはしない。読みやすさを優先する
+- 絵文字は必須ではない。使う場合は商品そのものや原材料に合うものだけ(例: 柿に🍊、お米に🍜は使わない)。合うものがなければ使わない
 - 商品説明の文をそのまま写さず、短く読みやすい言葉に言い換える(意味は変えない)
 - 商品説明にない味・食感・香り・食べ方・使い道・産地・製法・生産者・数量・受賞歴・季節限定などは書かない(創作しない)
 - 文字数を稼ぐための文は足さない。伝えることが少なければ短くてよい
@@ -997,7 +1032,8 @@ ${STYLE_REFERENCE}
 - 空行を2つ以上続けない。行頭・行末に空白を入れない
 ${weekPosts.length ? `
 この週のほかの投稿(見出しの言い回し・構成・切り口・終わり方が似ないようにする):
-${weekPosts.map(w => `- 見出し「${w.opening}」/ 最後の一文「${w.lastSentence}」/ 構成 ${w.signature} / 切り口 ${w.focus || '-'}`).join('\n')}
+${weekPosts.map(w => `- 見出し「${w.opening}」(形: ${w.headlineShape || headlineShape(w.opening)})/ 最後の一文「${w.lastSentence}」/ 構成 ${w.signature} / 切り口 ${w.focus || '-'}`).join('\n')}
+(この週の見出し: 絵文字で始まるもの ${weekPosts.filter(w => startsWithEmoji(w.opening)).length}件、「」で商品名などを囲むもの ${weekPosts.filter(w => /「[^」]+」/.test(w.opening)).length}件。多い形は避ける)
 ` : ''}${examples.length ? `\n公式Xの投稿例(雰囲気の参考。文章をそのまま流用しない):\n${examples.map(e => `---\n${e}`).join('\n')}\n---\n` : ''}
 商品情報(事実はここに書かれていることだけを使う):
 商品ID: ${product.id}
@@ -1026,7 +1062,9 @@ ${anniversary.description}
 - 「▼詳細はこちら」、URL、ハッシュタグは本文に入れない(後から自動で付ける)
 ${avoid.openings.length ? `- 次の書き出しと似た1行目にしない:\n${avoid.openings.map(o => `  ・${o}`).join('\n')}` : ''}
 ${avoid.closings.length ? `- 次の締めくくりと似た最後の一言にしない:\n${avoid.closings.map(o => `  ・${o}`).join('\n')}` : ''}
-- hashtags には ${CONFIG.FIXED_HASHTAGS.join(' ')} 以外のハッシュタグをちょうど${CONFIG.EXTRA_HASHTAGS}個入れる。地域名・商品名・商品ジャンルなどから、商品情報に実際に書かれている言葉を使う
+- hashtags には ${CONFIG.FIXED_HASHTAGS.join(' ')} 以外のハッシュタグをちょうど${CONFIG.EXTRA_HASHTAGS}個入れる。
+  商品名・産地・特徴・季節性などを考えて、この商品に関連の深い自然な言葉を選ぶ(「#米」のような広い言葉でも、商品に関連していればよい)。
+  言葉は商品情報に書かれているものを使う
 - claims には本文に書いた事実(特徴・産地・製法・数量・生産者など)を1つずつ挙げ、evidence に根拠となる商品情報の文を一字一句そのまま引用する
 
 出力は次のJSON形式のみ。前後に説明文やコードブロック記号は一切つけないこと。
@@ -1075,7 +1113,10 @@ function evaluatePost(data, date, product, anniversary, avoid) {
     const word = tag.slice(1);
     if (!/^#[^\s#]+$/.test(tag)) issues.push(`ハッシュタグの形式が不正: ${tag}`);
     else if (CONFIG.FIXED_HASHTAGS.includes(tag)) issues.push(`固定のハッシュタグと重複: ${tag}`);
-    else if (!sourceNorm.includes(norm(word))) issues.push(`商品情報にない言葉のハッシュタグ: ${tag}`);
+    // 句読点・記号の違いは無視して照合する(例: #福笑い と 商品名の「福､笑い」)
+    else if (!phraseKey(productSourceText(product)).toLowerCase().includes(phraseKey(word).toLowerCase())) {
+      issues.push(`商品情報にない言葉のハッシュタグ: ${tag}`);
+    }
   }
   if (new Set(hashtags).size !== hashtags.length) issues.push('ハッシュタグが重複しています');
 
@@ -1108,7 +1149,7 @@ function evaluatePost(data, date, product, anniversary, avoid) {
   return {
     ok: issues.length === 0 && factIssues.length === 0,
     body, message, hashtags, opening, closing, bodyChars, emojiCount, claims, focus,
-    lastSentence: shape.lastSentence, signature: shape.signature,
+    lastSentence: shape.lastSentence, signature: shape.signature, headlineShape: headlineShape(opening),
     anniversaryUsed, anniversaryReason: String(data.anniversary_reason || ''),
     issues, factIssues, styleIssues, notes
   };
@@ -1352,6 +1393,7 @@ function renderWeeklyHtml({ weekStart, dates, posts, stats, anniversaries, assig
         <td>${esc(p.opening)}</td>
         <td>${esc(p.lastSentence)}</td>
         <td style="white-space:nowrap">${esc(p.signature)}</td>
+        <td>${esc(headlineShape(p.opening))}</td>
         <td>${esc(p.focus)}</td>
         <td class="${p.similarity?.length ? 'ng' : 'ok'}">${p.similarity?.length ? `⚠ ${p.similarity.map(esc).join('<br>⚠ ')}` : '✓'}${p.rewrittenFor ? '<br><span class="meta">似すぎていたため書き直し済み</span>' : ''}</td>
       </tr>`).join('');
@@ -1459,10 +1501,10 @@ ${done.problems.length ? `
 
   <section class="panel">
     <h2>週全体の類似チェック</h2>
-    <p class="meta">見出し・最後の一文の言い回し(商品名を除く)、文末、構成(H=見出し、数字=各段落の文の数)、切り口を7件で比べています。
+    <p class="meta">見出し・最後の一文の言い回し(商品名を除く)、文末、構成(H=見出し、数字=各段落の文の数)、見出しの形(絵文字・「」の位置)、切り口を7件で比べています。
       似すぎ ${weekReview.checked}件 → 書き直し ${weekReview.rewritten.length}件 / 残り ${weekReview.remaining}件${weekReview.skipped ? `(上限を超えた${weekReview.skipped}件は書き直していません)` : ''}</p>
     <table>
-      <tr><th>投稿日</th><th>見出し</th><th>最後の一文</th><th>構成</th><th>切り口</th><th>判定</th></tr>${reviewRows || '<tr><td colspan="6">対象なし</td></tr>'}
+      <tr><th>投稿日</th><th>見出し</th><th>最後の一文</th><th>構成</th><th>見出しの形</th><th>切り口</th><th>判定</th></tr>${reviewRows || '<tr><td colspan="7">対象なし</td></tr>'}
     </table>
   </section>
 
