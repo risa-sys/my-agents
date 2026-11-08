@@ -1,0 +1,47 @@
+{
+  "version": 2,
+  "entries": [
+    {
+      "productId": "6803690356849",
+      "handle": "n05618",
+      "title": "【令和8年産・新米】生産履歴付き 会津産 コシヒカリ",
+      "postDate": "2026-11-09",
+      "week": "2026-11-09",
+      "status": "candidate",
+      "dataSource": "live",
+      "opening": "🌾 炊き上がりのつやと粘り、会津産コシヒカリ",
+      "closing": "生産履歴が開示されているのも安心なポイントです。",
+      "generatedAt": "2026-11-08T14:41:37.338Z",
+      "genre": "お米",
+      "factCheck": "passed"
+    },
+    {
+      "productId": "6907975794801",
+      "handle": "c001a09",
+      "title": "【令和8年産・新米】田村産 光農園のお米　五百川・ひとめぼれ・コシヒカリ・天のつぶ・里山のつぶ・にじのきらめき（無洗米）",
+      "postDate": "2026-11-12",
+      "week": "2026-11-09",
+      "status": "candidate",
+      "dataSource": "live",
+      "opening": "あぶくま高原の伏流水で育つ、田村市のお米",
+      "closing": "炊き上がりがつややかで、もちもちとしたごはんからあっさりとした食感まで、品種ごとに異なる味わいを選べる無洗米です。",
+      "generatedAt": "2026-11-08T14:41:37.338Z",
+      "genre": "お米",
+      "factCheck": "passed"
+    },
+    {
+      "productId": "4455110246513",
+      "handle": "n16108",
+      "title": "【令和8年産】農匠米　ミルキークイーン",
+      "postDate": "2026-11-13",
+      "week": "2026-11-09",
+      "status": "candidate",
+      "dataSource": "live",
+      "opening": "冷めてもやわらかさが続く、お弁当やおにぎりのお米",
+      "closing": "毎日のお弁当や朝のおにぎりにはもちろん、いつものお米に少し混ぜて全体のツヤと粘りを引き立てる使い方もできます。",
+      "generatedAt": "2026-11-08T14:41:37.338Z",
+      "genre": "お米",
+      "factCheck": "passed"
+    }
+  ]
+}
