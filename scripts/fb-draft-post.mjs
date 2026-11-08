@@ -5,19 +5,30 @@
  * 1商品を選び、Geminiで投稿文を作って Facebookページに「下書き」として保存する。
  * 公開はしない。Meta Business Suite の下書き一覧で内容を確認し、手動で公開する。
  *
- * 必要な環境変数(GitHub Secrets から渡す):
- *   FB_PAGE_ID, FB_PAGE_ACCESS_TOKEN, GEMINI_API_KEY
- *
  * MODE(環境変数):
- *   check   … トークンとページの疎通だけ確認する(投稿文の生成・投稿はしない)
- *   dry-run … 投稿文を生成してログに出すだけ(Facebookには何も作らない)
- *   draft   … 投稿文を生成し、Facebookページに下書きとして保存する(既定)
+ *   preview … 投稿文を生成し、ローカルのHTMLプレビューを書き出すだけ(既定)。
+ *             Facebookへは一切通信しない(GET も含めて遮断する)。必要: GEMINI_API_KEY
+ *   check   … トークンとページの疎通だけ確認する(読み取りのみ)。必要: FB_PAGE_ACCESS_TOKEN
+ *   draft   … 投稿文を生成し、Facebookページに下書きとして保存する。
+ *             FB_DRAFT_APPROVAL にページIDを明示的に入れたときだけ動く。
+ *             必要: FB_PAGE_ID, FB_PAGE_ACCESS_TOKEN, GEMINI_API_KEY, FB_DRAFT_APPROVAL
+ *
+ * 安全装置:
+ *   - Facebook への通信はすべて guardedFacebookFetch を通す。preview では全遮断、check では GET のみ、
+ *     書き込みは draft かつ承認済みのときだけ、許可したページの /feed への POST に限る。
+ *   - 下書きの送信パラメータは許可リスト方式で、published=false と
+ *     unpublished_content_type=DRAFT 以外の値では送信しない(公開・予約投稿は送れない)。
  */
-import { readFileSync, writeFileSync, appendFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 const CONFIG = {
   GEMINI_MODEL: process.env.GEMINI_MODEL || 'gemini-2.5-flash',
-  GRAPH_API_VERSION: 'v21.0',
+  GRAPH_API_VERSION: 'v26.0',
+  // draft で書き込みを許可する唯一のページ(ふくしま市場)
+  APPROVED_PAGE_ID: '277404605612561',
+  PREVIEW_FILE: 'preview/fb-preview.html',
   SHOP_BASE_URL: 'https://fukushima-ichiba.com',
   PRODUCT_SOURCE_PATHS: [
     '/collections/ranking_top10/products.json?limit=20', // 基準: 売れ筋ランキング
@@ -32,9 +43,19 @@ const CONFIG = {
   TOKEN_WARN_DAYS: 14 // トークンの残り日数がこれを切ったら Issue で知らせる
 };
 
-const MODE = process.env.MODE || 'draft';
+const MODES = ['preview', 'check', 'draft'];
+const MODE = process.env.MODE || 'preview';
 
 async function main() {
+  if (!MODES.includes(MODE)) {
+    throw new Error(`MODE は ${MODES.join(' / ')} のいずれかを指定してください(指定値: ${MODE})。`);
+  }
+  if (MODE === 'preview') {
+    await runPreview();
+    return;
+  }
+  if (MODE === 'draft') assertDraftApproved();
+
   const token = requireEnv('FB_PAGE_ACCESS_TOKEN');
   if (MODE === 'check') {
     // FB_PAGE_ID が未登録・誤りでも、登録すべきページIDが分かるようにする
@@ -58,24 +79,14 @@ async function main() {
     return;
   }
 
-  const products = await collectCandidateProducts();
-  if (products.length === 0) {
-    throw new Error('ふくしま市場の商品情報を取得できませんでした。サイト構成が変わっていないか確認してください。');
-  }
-
-  const draft = await generateDraftWithGemini(products);
-  const product = products.find(p => p.handle === draft.product_handle) || products[0];
-  const productUrl = `${CONFIG.SHOP_BASE_URL}/products/${product.handle}`;
-
-  let postId = '(dry-run のため未作成)';
-  if (MODE === 'draft') {
-    postId = await createDraftPost(pageId, page.accessToken, draft.message, productUrl);
-    recordProductAsPosted(product.handle);
-    log(`Facebook下書き作成完了: ${postId}`);
-  }
+  const products = await collectProductsOrThrow();
+  const { draft, product, productUrl } = await composePost(products);
+  const postId = await createDraftPost(pageId, page.accessToken, draft.message, productUrl);
+  recordProductAsPosted(product.handle);
+  log(`Facebook下書き作成完了: ${postId}`);
 
   summary([
-    `### ${MODE === 'draft' ? 'Facebook下書きを作成しました' : '投稿文プレビュー(dry-run)'}`,
+    '### Facebook下書きを作成しました',
     `- 話題: ${draft.theme}`,
     `- 商品: ${product.title}(${product.price}円)`,
     `- 商品ページ: ${productUrl}`,
@@ -87,6 +98,180 @@ async function main() {
     '',
     'Meta Business Suite の下書きから確認して、問題なければ手動で公開してください: https://business.facebook.com/latest/posts?tab=drafts'
   ].join('\n'));
+}
+
+/**
+ * Facebookに一切通信せず、投稿文を生成してローカルのHTMLプレビューに書き出す。
+ * 紹介済み履歴も更新しない。
+ */
+async function runPreview() {
+  const products = await collectProductsOrThrow();
+  const { draft, product, productUrl } = await composePost(products);
+  const file = resolve(CONFIG.PREVIEW_FILE);
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, renderPreviewHtml({ draft, product, productUrl, candidateCount: products.length }));
+
+  summary([
+    '### 投稿文プレビュー(Facebookには送信していません)',
+    `- 話題: ${draft.theme}`,
+    `- 商品: ${product.title}(${product.price}円)`,
+    `- 商品ページ: ${productUrl}`,
+    `- 画像: ${product.image || '(なし)'}`,
+    '',
+    '```',
+    draft.message,
+    '```',
+    '',
+    `プレビュー: ${pathToFileURL(file).href}`
+  ].join('\n'));
+}
+
+async function collectProductsOrThrow() {
+  const products = await collectCandidateProducts();
+  if (products.length === 0) {
+    throw new Error('ふくしま市場の商品情報を取得できませんでした。サイト構成が変わっていないか確認してください。');
+  }
+  return products;
+}
+
+async function composePost(products) {
+  const draft = await generateDraftWithGemini(products);
+  const product = products.find(p => p.handle === draft.product_handle) || products[0];
+  const productUrl = `${CONFIG.SHOP_BASE_URL}/products/${product.handle}`;
+  return { draft, product, productUrl };
+}
+
+function renderPreviewHtml({ draft, product, productUrl, candidateCount }) {
+  const generatedAt = new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
+  const paramRows = Object.entries(draftPostParams(draft.message, productUrl))
+    .map(([k, v]) => `<tr><th>${esc(k)}</th><td class="pre">${esc(v)}</td></tr>`).join('');
+  const domain = new URL(productUrl).hostname.toUpperCase();
+  return `<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Facebook投稿プレビュー</title>
+<style>
+  :root { --bg:#f0f2f5; --card:#fff; --text:#050505; --sub:#65676b; --line:#ced0d4; --link:#f0f2f5; --warn:#fff4e5; --warn-line:#f0b45a; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#18191a; --card:#242526; --text:#e4e6eb; --sub:#b0b3b8; --line:#3e4042; --link:#3a3b3c; --warn:#3a2d17; --warn-line:#a87b2f; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family: system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Yu Gothic UI", sans-serif; }
+  main { max-width:560px; margin:0 auto; padding:16px; }
+  a { color:#1877f2; }
+  .notice { background:var(--warn); border:1px solid var(--warn-line); border-radius:8px; padding:10px 12px; font-size:14px; margin-bottom:16px; }
+  .post { background:var(--card); border-radius:8px; box-shadow:0 1px 2px rgba(0,0,0,.2); overflow:hidden; }
+  .head { display:flex; gap:8px; align-items:center; padding:12px 16px 0; }
+  .avatar { width:40px; height:40px; border-radius:50%; background:#1877f2; color:#fff; display:grid; place-items:center; font-weight:700; }
+  .name { font-weight:600; font-size:15px; }
+  .meta { color:var(--sub); font-size:13px; }
+  .message { padding:12px 16px; white-space:pre-wrap; font-size:15px; line-height:1.4; overflow-wrap:anywhere; }
+  .card { display:block; color:inherit; text-decoration:none; border-top:1px solid var(--line); }
+  .card img { display:block; width:100%; aspect-ratio:1.91/1; object-fit:cover; background:var(--line); }
+  .card .noimg { aspect-ratio:1.91/1; display:grid; place-items:center; color:var(--sub); background:var(--link); }
+  .card .info { background:var(--link); padding:10px 12px; }
+  .card .domain { color:var(--sub); font-size:12px; }
+  .card .title { font-weight:600; font-size:16px; margin-top:2px; }
+  h2 { font-size:15px; margin:24px 0 8px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; background:var(--card); border-radius:8px; overflow:hidden; }
+  th, td { text-align:left; vertical-align:top; padding:6px 10px; border-bottom:1px solid var(--line); overflow-wrap:anywhere; }
+  th { width:34%; color:var(--sub); font-weight:500; }
+  td.pre { white-space:pre-wrap; }
+</style>
+</head>
+<body>
+<main>
+  <div class="notice">これはローカルのプレビューです。Facebookには何も送信していません。</div>
+  <article class="post">
+    <div class="head">
+      <div class="avatar">ふ</div>
+      <div><div class="name">ふくしま市場</div><div class="meta">プレビュー · ${esc(generatedAt)}</div></div>
+    </div>
+    <div class="message">${esc(draft.message)}</div>
+    <a class="card" href="${esc(productUrl)}" target="_blank" rel="noopener">
+      ${product.image ? `<img src="${esc(product.image)}" alt="${esc(product.title)}">` : '<div class="noimg">画像なし</div>'}
+      <div class="info"><div class="domain">${esc(domain)}</div><div class="title">${esc(product.title)}</div></div>
+    </a>
+  </article>
+
+  <h2>内容</h2>
+  <table>
+    <tr><th>話題</th><td>${esc(draft.theme)}</td></tr>
+    <tr><th>商品</th><td>${esc(product.title)}(${esc(product.price)}円)</td></tr>
+    <tr><th>商品ページ</th><td><a href="${esc(productUrl)}" target="_blank" rel="noopener">${esc(productUrl)}</a></td></tr>
+    <tr><th>画像URL</th><td>${product.image ? `<a href="${esc(product.image)}" target="_blank" rel="noopener">${esc(product.image)}</a>` : '(なし)'}</td></tr>
+    <tr><th>文字数</th><td>${[...draft.message].length}文字</td></tr>
+    <tr><th>候補商品数</th><td>${candidateCount}件</td></tr>
+  </table>
+
+  <h2>draft モードで送信される場合のパラメータ(今回は未送信)</h2>
+  <table>${paramRows}<tr><th>access_token</th><td>(表示しません)</td></tr></table>
+  <p class="meta">画像はFacebookがリンク先ページから自動取得するため、実際の表示はこのプレビューと異なる場合があります。</p>
+</main>
+</body>
+</html>
+`;
+}
+
+function esc(value) {
+  const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+  return String(value ?? '').replace(/[&<>"']/g, c => map[c]);
+}
+
+/**
+ * draft の実行には、FB_DRAFT_APPROVAL にページIDを明示的に入れる必要がある。
+ * 入力ミスや既定値で下書きが作られないよう、対象ページも APPROVED_PAGE_ID に固定する。
+ */
+function assertDraftApproved() {
+  const pageId = requireEnv('FB_PAGE_ID');
+  if (pageId !== CONFIG.APPROVED_PAGE_ID) {
+    throw new Error(`FB_PAGE_ID が許可されたページ(${CONFIG.APPROVED_PAGE_ID})と一致しないため、何も送信せずに中止しました。`);
+  }
+  if (process.env.FB_DRAFT_APPROVAL !== CONFIG.APPROVED_PAGE_ID) {
+    throw new Error(`draft の実行には承認が必要です。FB_DRAFT_APPROVAL に ${CONFIG.APPROVED_PAGE_ID} を指定してください。何も送信せずに中止しました。`);
+  }
+}
+
+/**
+ * Facebook への通信はすべてここを通す。
+ * - preview: すべて遮断
+ * - check: 読み取り(GET)のみ
+ * - draft: GET と、承認済みページの /feed への下書き POST のみ
+ */
+async function guardedFacebookFetch(url, init = {}) {
+  const method = (init.method || 'GET').toUpperCase();
+  if (MODE === 'preview') {
+    throw new Error('preview モードではFacebookへの通信は禁止されています。');
+  }
+  if (method === 'GET') return fetch(url, init);
+
+  const feedUrl = `https://graph.facebook.com/${CONFIG.GRAPH_API_VERSION}/${CONFIG.APPROVED_PAGE_ID}/feed`;
+  if (MODE !== 'draft' || method !== 'POST' || url !== feedUrl) {
+    throw new Error(`許可されていないFacebookへの書き込みを遮断しました: ${method} ${url}`);
+  }
+  assertDraftApproved();
+  assertDraftOnlyParams(init.body);
+  return fetch(url, init);
+}
+
+/**
+ * 下書き保存以外のパラメータ(公開・予約など)が含まれていたら送信しない。
+ */
+function assertDraftOnlyParams(body) {
+  if (!(body instanceof URLSearchParams)) throw new Error('下書きの送信パラメータの形式が不正です。');
+  const allowed = new Set(['message', 'link', 'published', 'unpublished_content_type', 'access_token']);
+  for (const key of new Set(body.keys())) {
+    if (!allowed.has(key)) throw new Error(`許可されていないパラメータ "${key}" が含まれるため送信を中止しました。`);
+    if (body.getAll(key).length !== 1) throw new Error(`パラメータ "${key}" が重複しているため送信を中止しました。`);
+  }
+  if (body.get('published') !== 'false') {
+    throw new Error('published=false でないため送信を中止しました(公開投稿の防止)。');
+  }
+  if (body.get('unpublished_content_type') !== 'DRAFT') {
+    throw new Error('unpublished_content_type=DRAFT でないため送信を中止しました(予約投稿などの防止)。');
+  }
 }
 
 /**
@@ -158,7 +343,8 @@ async function fetchShopifyProducts(path) {
         vendor: p.vendor,
         productType: p.product_type,
         tags: Array.isArray(p.tags) ? p.tags.join(', ') : p.tags,
-        price: p.variants[0].price
+        price: p.variants[0].price,
+        image: p.images?.[0]?.src || ''
       }));
   } catch {
     return [];
@@ -255,16 +441,11 @@ ${productListText}
 
 /**
  * Facebookページに下書き投稿を作成する(公開はしない)。
+ * 送信前に guardedFacebookFetch が承認とパラメータを検査する。
  */
 async function createDraftPost(pageId, pageToken, message, link) {
-  const body = new URLSearchParams({
-    message,
-    link,
-    published: 'false',
-    unpublished_content_type: 'DRAFT',
-    access_token: pageToken
-  });
-  const res = await fetch(`https://graph.facebook.com/${CONFIG.GRAPH_API_VERSION}/${pageId}/feed`, {
+  const body = new URLSearchParams({ ...draftPostParams(message, link), access_token: pageToken });
+  const res = await guardedFacebookFetch(`https://graph.facebook.com/${CONFIG.GRAPH_API_VERSION}/${pageId}/feed`, {
     method: 'POST',
     body
   });
@@ -273,8 +454,12 @@ async function createDraftPost(pageId, pageToken, message, link) {
   return json.id;
 }
 
+function draftPostParams(message, link) {
+  return { message, link, published: 'false', unpublished_content_type: 'DRAFT' };
+}
+
 async function graphGet(path, token) {
-  const res = await fetch(`https://graph.facebook.com/${CONFIG.GRAPH_API_VERSION}/${path}`, {
+  const res = await guardedFacebookFetch(`https://graph.facebook.com/${CONFIG.GRAPH_API_VERSION}/${path}`, {
     headers: { Authorization: `Bearer ${token}` }
   });
   const json = await res.json();

@@ -9,11 +9,12 @@ Google Apps Script トリガーが担当します)。
 ## エージェント一覧
 
 - `daily-task-agent.gs` — 前日のメールから「今日やることリスト」を作成し、自分宛に送信
-- `scripts/fb-draft-post.mjs`(GitHub Actions で実行) — 毎朝8:30に、ふくしま市場([fukushima-ichiba.com](https://fukushima-ichiba.com/))の
+- `scripts/fb-draft-post.mjs`(手元または GitHub Actions で手動実行。自動実行はしない) — ふくしま市場([fukushima-ichiba.com](https://fukushima-ichiba.com/))の
   売れ筋ランキング([collections/ranking_top10](https://fukushima-ichiba.com/collections/ranking_top10))を基準に、
   新着([collections/new-1](https://fukushima-ichiba.com/collections/new-1))も含めた候補から1商品を選び、Geminiで投稿文を作って
   Facebookページ([facebook.com/fukushimaichiba](https://www.facebook.com/fukushimaichiba/))に
   **下書きとして保存**する。公開はしない(Meta Business Suiteで確認して手動で公開する)。
+  既定はローカルプレビューのみで、Facebookへは送信しない。
   直近30日以内に紹介した商品は除外する(履歴は `data/fb-posted-history.json` に自動コミット)。
   詳しくは下の「Facebook下書きエージェント」を参照。
 
@@ -69,8 +70,23 @@ Google Apps Script トリガーが担当します)。
 
 ## Facebook下書きエージェント(GitHub Actions)
 
-`.github/workflows/fb-draft-post.yml` が毎朝8:30(JST)に `scripts/fb-draft-post.mjs` を実行する。
+`scripts/fb-draft-post.mjs` を手元または `.github/workflows/fb-draft-post.yml`(手動実行のみ)で動かす。
 Apps Script は使わない。
+
+| MODE | 内容 | Facebookへの通信 |
+|---|---|---|
+| `preview`(既定) | 投稿文を生成し、`preview/fb-preview.html` に投稿風プレビューを書き出す | なし(コード上で遮断) |
+| `check` | トークンとページの疎通確認 | 読み取り(GET)のみ |
+| `draft` | 下書きとして保存 | 承認(`FB_DRAFT_APPROVAL=277404605612561`)があるときだけ、`published=false` + `unpublished_content_type=DRAFT` の POST を1件 |
+
+### 0. 手元でプレビューする(Facebookには送信しない)
+
+```
+$env:GEMINI_API_KEY = "<キー>"   # PowerShell の場合
+npm run fb:preview
+```
+
+表示された `preview/fb-preview.html` をブラウザで開くと、投稿文・商品画像・リンクを確認できる。
 
 ### 1. トークンを用意する
 
@@ -92,11 +108,14 @@ gh secret set GEMINI_API_KEY         # https://aistudio.google.com/apikey
 ### 3. 動作を確認する(どのモードでも公開はされない)
 
 ```
+gh workflow run fb-draft-post.yml -f mode=preview   # 投稿文とプレビュー生成のみ(結果の Artifacts に fb-preview)
 gh workflow run fb-draft-post.yml -f mode=check     # トークンとページの疎通確認のみ
-gh workflow run fb-draft-post.yml -f mode=dry-run   # 投稿文を生成して表示するだけ
-gh workflow run fb-draft-post.yml -f mode=draft     # 実際に下書きとして保存
 gh run watch                                        # 結果を見る(投稿文は実行結果の Summary にも出る)
 ```
+
+`draft`(実際に下書きを作成)は、`-f mode=draft -f confirm_page_id=277404605612561` を指定し、
+さらに Environment `facebook-draft` の承認(Settings → Environments → Required reviewers)を通ったときだけ動く。
+`DRAFT` 指定の下書きが Business Suite の下書き一覧に表示されることは保証されていない点に注意。
 
 下書きは [Meta Business Suite の下書き一覧](https://business.facebook.com/latest/posts?tab=drafts) で確認し、手動で公開する。
 

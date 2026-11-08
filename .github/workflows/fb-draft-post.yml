@@ -1,28 +1,90 @@
 name: Facebook draft post (fukushima-ichiba)
 
+# 自動実行(schedule)は行わない。手動実行のみ。
+# 既定は preview(Facebookへは一切通信しない)。
 on:
-  schedule:
-    - cron: "30 23 * * *" # 毎朝 8:30 JST(GitHub側の混雑で数分〜数十分遅れることがある)
   workflow_dispatch:
     inputs:
       mode:
-        description: "check=トークン確認のみ / dry-run=文面生成のみ / draft=下書き保存"
+        description: "preview=文面とプレビュー生成のみ(Facebook通信なし) / check=トークン確認のみ(読み取り) / draft=下書き保存(承認が必要)"
         type: choice
-        options: [check, dry-run, draft]
-        default: check
-
-permissions:
-  contents: write # 紹介済み商品の履歴ファイルをコミットするため
-  issues: write # トークンの期限が近いときに Issue で知らせるため
+        options: [preview, check, draft]
+        default: preview
+      confirm_page_id:
+        description: "draft のときだけ: 承認としてページID 277404605612561 を入力(一致しないと何も送信しない)"
+        type: string
+        required: false
+        default: ""
 
 concurrency:
   group: fb-draft-post
   cancel-in-progress: false
 
 jobs:
-  draft:
+  # preview / check: Facebookへの書き込みは行わない
+  preview-or-check:
+    if: ${{ inputs.mode != 'draft' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write # トークンの期限が近いときに Issue で知らせるため(check のみ)
     steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run (${{ inputs.mode }})
+        id: post
+        env:
+          MODE: ${{ inputs.mode }}
+          # preview には Facebook のトークンを渡さない
+          FB_PAGE_ID: ${{ inputs.mode == 'check' && secrets.FB_PAGE_ID || '' }}
+          FB_PAGE_ACCESS_TOKEN: ${{ inputs.mode == 'check' && secrets.FB_PAGE_ACCESS_TOKEN || '' }}
+          GEMINI_API_KEY: ${{ inputs.mode == 'preview' && secrets.GEMINI_API_KEY || '' }}
+        run: node scripts/fb-draft-post.mjs
+
+      - name: Upload preview
+        if: ${{ inputs.mode == 'preview' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: fb-preview
+          path: preview/fb-preview.html
+          retention-days: 7
+
+      - name: Notify token expiry
+        if: ${{ steps.post.outputs.token_days_left != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPIRES: ${{ steps.post.outputs.token_expires }}
+          DAYS_LEFT: ${{ steps.post.outputs.token_days_left }}
+        run: |
+          title="Facebookトークンの有効期限が近づいています"
+          if [ -n "$(gh issue list --state open --search "in:title $title" --json number --jq '.[].number')" ]; then exit 0; fi
+          gh issue create --title "$title" --body "FB_PAGE_ACCESS_TOKEN の有効期限: ${EXPIRES}(残り${DAYS_LEFT}日)
+
+          Meta Business Suite のシステムユーザーでトークンを再生成し、
+          \`gh secret set FB_PAGE_ACCESS_TOKEN\` で差し替えてください。差し替えたらこの Issue を閉じてください。"
+
+  # draft: ページIDの入力と、Environment "facebook-draft" の承認を通ったときだけ実行する
+  draft:
+    if: ${{ inputs.mode == 'draft' }}
+    runs-on: ubuntu-latest
+    environment: facebook-draft
+    permissions:
+      contents: write # 紹介済み商品の履歴ファイルをコミットするため
+      issues: write # トークンの期限が近いときに Issue で知らせるため
+    steps:
+      - name: Check approval input
+        env:
+          CONFIRM: ${{ inputs.confirm_page_id }}
+        run: |
+          if [ "$CONFIRM" != "277404605612561" ]; then
+            echo "::error::confirm_page_id が一致しないため中止しました(Facebookへは何も送信していません)。"
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
@@ -32,7 +94,8 @@ jobs:
       - name: Create Facebook draft
         id: post
         env:
-          MODE: ${{ inputs.mode || 'draft' }}
+          MODE: draft
+          FB_DRAFT_APPROVAL: ${{ inputs.confirm_page_id }}
           FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
           FB_PAGE_ACCESS_TOKEN: ${{ secrets.FB_PAGE_ACCESS_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -49,11 +112,10 @@ jobs:
           if [ -n "$(gh issue list --state open --search "in:title $title" --json number --jq '.[].number')" ]; then exit 0; fi
           gh issue create --title "$title" --body "FB_PAGE_ACCESS_TOKEN の有効期限: ${EXPIRES}(残り${DAYS_LEFT}日)
 
-          期限が切れると毎朝の下書き作成が止まります。Meta Business Suite のシステムユーザーでトークンを再生成し、
+          Meta Business Suite のシステムユーザーでトークンを再生成し、
           \`gh secret set FB_PAGE_ACCESS_TOKEN\` で差し替えてください。差し替えたらこの Issue を閉じてください。"
 
       - name: Save posted-product history
-        if: ${{ (inputs.mode || 'draft') == 'draft' }}
         run: |
           git add data/fb-posted-history.json
           if git diff --cached --quiet; then exit 0; fi
