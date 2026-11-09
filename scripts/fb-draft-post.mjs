@@ -1935,35 +1935,108 @@ async function checkGeminiModels() {
   ].join('\n'));
 }
 
+// 投稿(予約・即時公開)に必要な権限
+const REQUIRED_SCOPES = ['pages_manage_posts', 'pages_read_engagement', 'pages_show_list'];
+
+/**
+ * 接続確認(読み取りのみ)。アプリ・トークンの種類と期限・権限・対象ページを確かめる。
+ * トークンそのものは表示しない。問題があれば最後にまとめて失敗にする。
+ */
 async function runCheck() {
   const token = requireEnv('FB_PAGE_ACCESS_TOKEN');
-  // FB_PAGE_ID が未登録・誤りでも、登録すべきページIDが分かるようにする
-  await warnIfTokenExpiresSoon(token);
-  const me = await graphGet('me?fields=name,id', token);
-  const pages = (await graphGet('me/accounts?fields=name,id', token)).data || [];
-  summary([
-    `### トークンの持ち主: ${me.name}`,
-    `このトークンで扱えるページ(${pages.length}件):`,
-    ...pages.map(p => `- ${p.name}: ${p.id}${p.id === process.env.FB_PAGE_ID ? ' ← FB_PAGE_ID と一致' : ''}`)
-  ].join('\n'));
-  if (!process.env.FB_PAGE_ID) return;
-  const pageId = process.env.FB_PAGE_ID;
-  const page = await graphGet(`${pageId}?fields=name`, token);
-  summary(`### トークン確認OK\n- ページ: ${page.name} (${pageId})`);
+  const pageId = process.env.FB_PAGE_ID || '';
+  const problems = [];
+  const lines = [];
+
+  // アプリ・トークンの種類・期限・権限
+  let info = null;
+  try {
+    info = (await graphGet(`debug_token?input_token=${encodeURIComponent(token)}`, token)).data;
+  } catch (e) {
+    problems.push('トークンの情報(アプリ・権限・期限)を読み取れません: ' + e.message);
+  }
+  if (info) {
+    if (!info.is_valid) problems.push('トークンが無効です');
+    lines.push(
+      '### アプリとトークン',
+      `- アプリ: ${info.application || '(不明)'}(アプリID: ${info.app_id || '不明'})`,
+      `- トークンの種類: ${info.type || '不明'}`,
+      `- 有効: ${info.is_valid ? 'はい' : 'いいえ'}`,
+      `- 有効期限: ${expiryText(info.expires_at)}`,
+      `- データアクセスの期限: ${expiryText(info.data_access_expires_at)}`,
+      '### 権限'
+    );
+    const scopes = info.scopes || [];
+    for (const scope of REQUIRED_SCOPES) {
+      const granular = (info.granular_scopes || []).find(g => g.scope === scope);
+      const forPage = !granular || !granular.target_ids || !pageId || granular.target_ids.includes(pageId);
+      const ok = scopes.includes(scope) && forPage;
+      if (!scopes.includes(scope)) problems.push(`権限 ${scope} がありません`);
+      else if (!forPage) problems.push(`権限 ${scope} の対象に FB_PAGE_ID のページが含まれていません`);
+      lines.push(`- ${scope}: ${ok ? 'OK' : 'NG'}`);
+    }
+    const others = scopes.filter(s => !REQUIRED_SCOPES.includes(s));
+    if (others.length) lines.push(`- そのほかの権限: ${others.join(', ')}`);
+    warnIfTokenExpiresSoon(info);
+  }
+
+  // トークンの持ち主と、扱えるページ(FB_PAGE_ID が未登録・誤りでも、登録すべきページIDが分かるようにする)
+  try {
+    const me = await graphGet('me?fields=name,id', token);
+    lines.push('### トークンの持ち主', `- ${me.name}`);
+  } catch (e) {
+    problems.push('トークンの持ち主を読み取れません: ' + e.message);
+  }
+  let pages = [];
+  try {
+    pages = (await graphGet('me/accounts?fields=name,id,tasks', token)).data || [];
+  } catch (e) {
+    problems.push('扱えるページの一覧を読み取れません: ' + e.message);
+  }
+  lines.push(
+    `### このトークンで扱えるページ(${pages.length}件)`,
+    ...pages.map(p => `- ${p.name}: ${p.id}${p.id === pageId ? ' ← FB_PAGE_ID と一致' : ''}(できること: ${(p.tasks || []).join(', ') || '不明'})`)
+  );
+
+  // 対象ページ(FB_PAGE_ID)
+  if (!pageId) {
+    problems.push('FB_PAGE_ID が登録されていません');
+  } else {
+    const listed = pages.find(p => p.id === pageId);
+    if (!listed) problems.push('FB_PAGE_ID のページが、このトークンで扱えるページにありません');
+    else if (!(listed.tasks || []).includes('CREATE_CONTENT')) problems.push('対象ページで投稿を作る権限(CREATE_CONTENT)がありません');
+    try {
+      const page = await graphGet(`${pageId}?fields=id,name,access_token`, token);
+      // 投稿時に使うページ用トークンが取れるかだけ確かめる。値はログに出さない
+      if (page.access_token) console.log(`::add-mask::${page.access_token}`);
+      if (!page.access_token) problems.push('対象ページのページ用トークンを取得できません');
+      lines.push(
+        '### 対象ページ(FB_PAGE_ID)',
+        `- ${page.name}(ページIDは FB_PAGE_ID と一致${page.id === pageId ? '' : 'しない'})`,
+        `- ページ用トークン: ${page.access_token ? '取得できた(表示しません)' : '取得できない'}`
+      );
+    } catch (e) {
+      problems.push('対象ページを読み取れません: ' + e.message);
+    }
+  }
+
+  lines.push('### 結果', problems.length ? problems.map(p => `- NG: ${p}`).join('\n') : '- 接続と権限はすべてOK');
+  summary(lines.join('\n'));
+  if (problems.length) throw new Error(`接続確認で問題が見つかりました(${problems.length}件)`);
+}
+
+function expiryText(sec) {
+  if (sec === undefined || sec === null) return '不明';
+  if (!sec) return '無期限';
+  const daysLeft = Math.floor((sec * 1000 - Date.now()) / (24 * 60 * 60 * 1000));
+  return `${new Date(sec * 1000).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' })}(残り${daysLeft}日)`;
 }
 
 /**
  * トークンの有効期限が近いときに警告を出す。
  * 残り TOKEN_WARN_DAYS 日を切ったら GITHUB_OUTPUT に書き出し、ワークフロー側で Issue を立てて知らせる。
  */
-async function warnIfTokenExpiresSoon(token) {
-  let data;
-  try {
-    data = (await graphGet(`debug_token?input_token=${encodeURIComponent(token)}`, token)).data;
-  } catch (e) {
-    log('トークンの有効期限を確認できませんでした: ' + e.message);
-    return;
-  }
+function warnIfTokenExpiresSoon(data) {
   if (!data || !data.expires_at) return; // 0 = 無期限
   const daysLeft = Math.floor((data.expires_at * 1000 - Date.now()) / (24 * 60 * 60 * 1000));
   const expiresText = new Date(data.expires_at * 1000).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
