@@ -331,5 +331,14 @@
         "decisionFile": "fb-decisions-2026-11-16-rev2.json"
       }
     }
+  ],
+  "testPosts": [
+    {
+      "at": "2026-11-09T12:08:32+09:00",
+      "hash": "6ecb75c725ea92f2",
+      "productId": "4455056900209",
+      "pageId": "277404605612561",
+      "result": "publishing"
+    }
   ]
 }
