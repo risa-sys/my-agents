@@ -3,18 +3,27 @@ name: Facebook mail approval - draft (fukushima-ichiba)
 # メール承認: 投稿案を作り、Apps Script(承認メール)に署名つきで送る。
 # - kind=week … 7日分(1日1件・各日18:00公開予定)をまとめて送る(承認メール1通)。start_date 空欄なら自動で決める
 # - kind=one  … 動作確認用に1件だけ送る(「公開する」で即時公開)
+# - kind=reschedule … 送った7日分の公開予定日を変える(batch_id と dates)。内容・判断はそのまま、承認メールを送り直す
 # - 手動実行のみ(schedule なし)。Facebook へは一切通信しない
 # - 承認前の投稿案は、公開のログ・成果物・fb-history に残さない(ログには投稿案IDと成否だけ)
 on:
   workflow_dispatch:
     inputs:
       kind:
-        description: "week=7日分 / one=1件(動作確認)"
+        description: "week=7日分 / one=1件(動作確認) / reschedule=公開予定日の変更"
         type: choice
-        options: [week, one]
+        options: [week, one, reschedule]
         default: week
       start_date:
         description: "7日分の最初の公開予定日(YYYY-MM-DD・日本時間)。空欄なら明日以降で予定・記録と重ならない最初の7日間"
+        type: string
+        required: false
+      batch_id:
+        description: "reschedule: まとめID"
+        type: string
+        required: false
+      dates:
+        description: "reschedule: 新しい公開予定日(今の予定の早い順に、YYYY-MM-DD をカンマ区切り)"
         type: string
         required: false
 
@@ -39,6 +48,7 @@ jobs:
         run: bash scripts/fb-history-branch.sh restore
 
       - name: Create drafts and send the approval mail
+        if: inputs.kind != 'reschedule'
         env:
           MODE: ${{ inputs.kind == 'one' && 'mail-draft' || 'mail-week' }}
           START_DATE: ${{ inputs.start_date }}
@@ -46,3 +56,12 @@ jobs:
           FB_MAIL_GAS_URL: ${{ secrets.FB_MAIL_GAS_URL }}
           FB_MAIL_SECRET: ${{ secrets.FB_MAIL_SECRET }}
         run: node scripts/fb-draft-post.mjs
+
+      - name: Change the publish dates and resend the approval mail
+        if: inputs.kind == 'reschedule'
+        env:
+          BATCH_ID: ${{ inputs.batch_id }}
+          DATES: ${{ inputs.dates }}
+          FB_MAIL_GAS_URL: ${{ secrets.FB_MAIL_GAS_URL }}
+          FB_MAIL_SECRET: ${{ secrets.FB_MAIL_SECRET }}
+        run: node scripts/fb-mail-reschedule.mjs

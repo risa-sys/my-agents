@@ -247,6 +247,7 @@ function handleApi_(req, cfg) {
   if (req.action === 'activeProducts') return apiActiveProducts_();
   if (req.action === 'createBatch') return apiCreateBatch_(req, cfg);
   if (req.action === 'claimScheduled') return apiClaimScheduled_(req, cfg);
+  if (req.action === 'reschedule') return apiReschedule_(req, cfg);
   throw apiError_('不明な要求です', 'unknown_action');
 }
 
@@ -445,6 +446,53 @@ function apiCreateBatch_(req, cfg) {
 }
 
 /**
+ * 7日分の公開予定日を変える(商品・投稿文・画像・判断はそのまま)。
+ * req.dates は今の公開予定の早い順に対応する新しい日付。承認画面のリンクは作り直し、承認メールを送り直す(古いリンクは使えなくなる)。
+ */
+function apiReschedule_(req, cfg) {
+  if (!cfg.owner || !cfg.uiUrl) throw apiError_('OWNER_EMAIL / UI_URL が設定されていません', 'not_configured');
+  const batchId = String(req.batchId || '');
+  const dates = Array.isArray(req.dates) ? req.dates.map(String) : [];
+  if (!/^[0-9a-f]{32}$/.test(batchId)) throw apiError_('まとめIDが不正です', 'invalid');
+  if (dates.some(x => !/^\d{4}-\d{2}-\d{2}$/.test(x) || isNaN(scheduledAtOf_(x)))) throw apiError_('日付が不正です', 'invalid');
+  if (new Set(dates).size !== dates.length) throw apiError_('同じ日付が含まれています', 'duplicate');
+  const now = Date.now();
+  for (const date of dates) {
+    if (!(scheduledAtOf_(date) > now + APP.MIN_LEAD_MS)) throw apiError_('公開予定が近すぎるか過ぎています: ' + date, 'invalid');
+  }
+  return withLock_(() => {
+    const all = draftIds_().map(loadDraft_).filter(Boolean);
+    const batch = all.filter(d => d.batchId === batchId).sort((a, b) => a.scheduledAt - b.scheduledAt);
+    if (!batch.length) throw apiError_('まとめが見つかりません', 'not_found');
+    if (batch.length !== dates.length) throw apiError_('日付の数(' + dates.length + ')が投稿案の数(' + batch.length + ')と合いません', 'invalid');
+    const bad = batch.filter(d => ['awaiting', 'decided', 'rejected'].indexOf(stateOf_(d)) < 0);
+    if (bad.length) throw apiError_('公開処理が始まった・終わった投稿案があるため変更できません(' + bad.map(d => d.postDate + ' ' + stateOf_(d)).join(', ') + ')', 'invalid_state');
+    const others = all.filter(d => d.batchId !== batchId && d.scheduledAt && SCHEDULED_DONE_STATES.indexOf(stateOf_(d)) < 0).map(d => d.postDate);
+    const clash = dates.filter(x => others.indexOf(x) >= 0);
+    if (clash.length) throw apiError_('ほかの投稿案の公開予定と重なります(' + clash.join(', ') + ')', 'duplicate');
+    const backup = batch.map(d => JSON.stringify(d));
+    const saved = batch.map((d, i) => {
+      const before = scheduleLabel_(d);
+      const key = randomHex_() + randomHex_();
+      d.postDate = dates[i];
+      d.scheduledAt = scheduledAtOf_(dates[i]);
+      d.expiresAt = d.scheduledAt + APP.SCHEDULE_WINDOW_MS;
+      d.keyHash = sha256Hex_(key);
+      event_(d, '公開予定を変更しました(' + before + ' → ' + scheduleLabel_(d) + ')。判断は引き継ぎ、承認画面のリンクを作り直しました');
+      return { d: d, key: key };
+    });
+    try {
+      saved.forEach(s => saveDraft_(s.d));
+      sendBatchMail_(saved, cfg, { rescheduled: true });
+    } catch (err) {
+      backup.forEach(json => saveDraft_(JSON.parse(json)));
+      throw apiError_('公開予定を変更できませんでした(元に戻しました): ' + err.message, 'mail_failed');
+    }
+    return { ok: true, batchId: batchId, items: saved.map(s => ({ draftId: s.d.id, postDate: s.d.postDate, state: s.d.state })) };
+  });
+}
+
+/**
  * 予定日時の公開処理(fb-mail-scheduled.yml)が、その日の投稿案を受け取る。
  * 承認済みだけを渡す。未判断は「確認待ち」にして知らせ、却下・終わったものは渡さない。
  */
@@ -536,7 +584,8 @@ function sendDraftMail_(d, key, cfg) {
   });
 }
 
-function sendBatchMail_(saved, cfg) {
+function sendBatchMail_(saved, cfg, opts) {
+  const re = !!(opts && opts.rescheduled);
   const first = saved[0].d;
   const last = saved[saved.length - 1].d;
   const range = Utilities.formatDate(new Date(first.scheduledAt), 'Asia/Tokyo', 'M/d') + '〜' + Utilities.formatDate(new Date(last.scheduledAt), 'Asia/Tokyo', 'M/d');
@@ -545,10 +594,11 @@ function sendBatchMail_(saved, cfg) {
   saved.forEach((s, i) => {
     const d = s.d;
     const link = cfg.uiUrl + '?d=' + d.id + '&k=' + s.key;
-    text.push('■ ' + (i + 1) + '. 公開予定 ' + scheduleLabel_(d), '商品: ' + d.title, '商品URL: ' + d.url, '画像: ' + d.image, '--- 投稿文 ---', d.message, '承認画面を開く: ' + link, '');
+    const st = re && d.state !== 'awaiting' ? '(現在: ' + (STATE_LABELS[d.state] || d.state) + ')' : '';
+    text.push('■ ' + (i + 1) + '. 公開予定 ' + scheduleLabel_(d) + st, '商品: ' + d.title, '商品URL: ' + d.url, '画像: ' + d.image, '--- 投稿文 ---', d.message, '承認画面を開く: ' + link, '');
     html +=
       '<div style="border:1px solid #ced0d4;border-radius:8px;padding:12px;margin:0 0 20px">' +
-      '<p style="margin:0 0 6px;font-size:15px"><b>' + (i + 1) + '. 公開予定 ' + esc(scheduleLabel_(d)) + '</b></p>' +
+      '<p style="margin:0 0 6px;font-size:15px"><b>' + (i + 1) + '. 公開予定 ' + esc(scheduleLabel_(d)) + '</b>' + (st ? ' <span style="color:#1a7f37">' + esc(st) + '</span>' : '') + '</p>' +
       '<p style="margin:0 0 8px"><b>' + esc(d.title) + '</b><br><a href="' + esc(d.url) + '">' + esc(d.url) + '</a></p>' +
       '<p style="margin:0 0 8px"><img src="' + esc(imageUrl_(d.image, 600)) + '" alt="' + esc(d.title) + '" width="240" style="max-width:100%;height:auto;border-radius:6px"></p>' +
       '<div style="background:#f7f8fa;border-radius:6px;padding:10px">' + messageHtml_(d.message, d.url) + '</div>' +
@@ -556,14 +606,16 @@ function sendBatchMail_(saved, cfg) {
   });
   const note = '承認(または修正して承認)した投稿だけを、それぞれの公開予定日時に自動で公開します。却下・未判断の投稿は公開しません。' +
     '判断は各投稿の公開予定時刻まで変更できます。予定時刻までに判断がない投稿は「確認待ち」になり、公開しません。';
+  const reNote = re ? '公開予定日を変更しました。商品・投稿文・画像は前回のメールと同じで、すでにした判断(承認・修正して承認・却下)は引き継いでいます。前回のメールのリンクは使えなくなりました。このメールのリンクから確認してください。' : '';
   MailApp.sendEmail({
     to: cfg.owner,
-    subject: '[ふくしま市場] 7日分の投稿案の承認のお願い(' + range + ' 各日' + APP.SCHEDULE_TIME + ')',
+    subject: '[ふくしま市場] ' + (re ? '【公開日変更】' : '') + '7日分の投稿案の承認のお願い(' + range + ' 各日' + APP.SCHEDULE_TIME + ')',
     name: 'ふくしま市場 投稿承認',
-    body: ['Facebook 投稿案7日分の承認をお願いします(まだ投稿していません)。', note, '投稿先: ' + APP.PAGE_NAME + '(ページID ' + APP.PAGE_ID + ')', ''].concat(text).join('\n'),
+    body: ['Facebook 投稿案7日分の承認をお願いします(まだ投稿していません)。'].concat(reNote ? [reNote] : []).concat([note, '投稿先: ' + APP.PAGE_NAME + '(ページID ' + APP.PAGE_ID + ')', '']).concat(text).join('\n'),
     htmlBody:
       '<div style="font-family:sans-serif;max-width:640px;line-height:1.6">' +
       '<p>Facebook 投稿案<b>7日分</b>の承認をお願いします(<b>まだ投稿していません</b>)。</p>' +
+      (reNote ? '<p style="background:#fff4e5;border-radius:6px;padding:8px 10px"><b>' + esc(reNote) + '</b></p>' : '') +
       '<p style="font-size:13px;color:#444">' + esc(note) + '</p>' +
       '<p style="font-size:13px;color:#65676b">投稿先: ' + esc(APP.PAGE_NAME) + '(ページID ' + APP.PAGE_ID + ')</p>' + html +
       '<p style="color:#65676b;font-size:13px">承認画面は、このプロジェクトの所有者の Google アカウントでログインしているときだけ開けます。画面を開いただけでは何も変わりません。<br>' +
