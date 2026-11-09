@@ -1,0 +1,44 @@
+name: Facebook mail approval - publish (fukushima-ichiba)
+
+# メール承認からの公開(1件)。承認画面で「公開する」を押したときに Apps Script が起動する。
+# - schedule なし。手で実行しても、承認画面で「公開する」が押された投稿案でなければ何もしない
+#   (承認済みの内容は Apps Script から署名つきで1回だけ受け取る)
+# - 実際に投稿するのは、リポジトリの変数 FB_MAIL_PUBLISH_ENABLED が true のときだけ。それ以外は確認だけ
+# - 公開前の投稿案の中身(本文・商品名)はログに出さない
+on:
+  workflow_dispatch:
+    inputs:
+      draft_id:
+        description: "投稿案ID(承認画面の「公開する」から自動で指定される)"
+        type: string
+        required: true
+
+concurrency:
+  group: fb-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # fb-history の mailPosts への記録(main には書き込まない)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Publish one approved post
+        env:
+          DRAFT_ID: ${{ inputs.draft_id }}
+          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+          FB_PAGE_ACCESS_TOKEN: ${{ secrets.FB_PAGE_ACCESS_TOKEN }}
+          FB_MAIL_GAS_URL: ${{ secrets.FB_MAIL_GAS_URL }}
+          FB_MAIL_SECRET: ${{ secrets.FB_MAIL_SECRET }}
+          FB_MAIL_PUBLISH_ENABLED: ${{ vars.FB_MAIL_PUBLISH_ENABLED }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          node scripts/fb-mail-publish.mjs publish --draft "$DRAFT_ID"

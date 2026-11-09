@@ -13,6 +13,9 @@
  *             Facebookへは一切通信しない。必要: GEMINI_API_KEY
  *   check   … トークンとページの疎通だけ確認する(読み取りのみ)。必要: FB_PAGE_ACCESS_TOKEN
  *   draft   … 停止中。週次版の下書き保存が完成するまで使わない。
+ *   mail-draft … メール承認の動作確認用。投稿案を1件だけ作り、署名つきで Apps Script(承認メール)へ送る。
+ *             投稿案は公開の GitHub(fb-history・ログ・成果物)には残さない(ログには「作った/作れなかった」だけを出す)。
+ *             Facebookへは一切通信しない。必要: GEMINI_API_KEY / FB_MAIL_GAS_URL / FB_MAIL_SECRET
  *
  * 安全装置:
  *   - Facebook への通信はすべて guardedFacebookFetch を通す。check の GET 以外はすべて遮断する
@@ -25,6 +28,8 @@ import { dirname, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { RULES, unsupportedNumbers } from './fb-review-rules.mjs';
 import { hashOf, reviewAssets, reviewBar, reviewRecordFromEntry, reviewWidget } from './fb-review-ui.mjs';
+import { ALL_STATUSES, LOCKED_STATUSES, STATUS_LABELS } from './fb-publish-core.mjs';
+import { callGas, checkGasUrl } from './fb-mail-sign.mjs';
 
 const CONFIG = {
   // 先頭から順に使う。2つ目以降は先頭が混雑・上限・通信エラーで使えないときの予備
@@ -91,8 +96,9 @@ const CONFIG = {
   // 週次の生成と履歴
   DAYS_PER_BATCH: 7,
   HISTORY_FILE: process.env.HISTORY_FILE || 'data/fb-post-history.json', // テストでは *.test.json しか使えない
-  // candidate=プレビューで選んだ候補 / approved=承認した(修正して承認を含む) / rejected=不採用 / published=公開済み
-  HISTORY_STATUSES: ['candidate', 'approved', 'rejected', 'published'],
+  // candidate=プレビューで選んだ候補 / approved=承認した(修正して承認を含む) / rejected=不採用 /
+  // 以降は投稿予約(fb-publish.mjs)で変わる: scheduling・scheduled・published・cancelled・cancel_failed・needs_check・skipped・failed
+  HISTORY_STATUSES: ALL_STATUSES,
   REUSE_BLOCK_DAYS: 30, // 投稿予定日の前後この日数に選ばれた商品は選ばない
   RECENT_PHRASES_COUNT: 14, // 書き出し・締めくくりが続かないよう、直近の分を避けさせる
   PREVIEW_DIR: 'preview',
@@ -132,15 +138,17 @@ const STYLE_REFERENCE = `🍂 会津の秋の味覚「会津みしらず柿」
 
 季節限定の味わいをぜひお楽しみください♪`;
 
-const MODES = ['preview', 'models', 'check', 'draft'];
+const MODES = ['preview', 'models', 'check', 'draft', 'mail-draft'];
 const MODE = process.env.MODE || 'preview';
+// mail-draft では、承認前の投稿案(商品名・本文)を公開のログに出さない。途中経過はメモリにだけ残し、失敗したときだけ承認メールの宛先に送る
+const QUIET = MODE === 'mail-draft';
+const quietLog = [];
 const IS_MOCK = CONFIG.DATA_SOURCE === 'mock';
 const IMAGE_HOSTS = IS_MOCK ? CONFIG.MOCK_IMAGE_HOSTS : CONFIG.IMAGE_HOSTS;
 const MOCK_LABEL = 'テスト用データ・投稿不可';
 
 const SOURCE_LABELS = { ranking: '人気ランキング', new: '新商品', all: '全商品' };
 const AVAILABILITY_LABELS = { in_stock: '在庫あり', sold_out: '売り切れ', unknown: '在庫未確認' };
-const STATUS_LABELS = { candidate: '候補', approved: '承認済み', rejected: '不採用', published: '公開済み' };
 
 async function main() {
   if (!MODES.includes(MODE)) {
@@ -150,6 +158,7 @@ async function main() {
     throw new Error('draft モードは週次版が完成するまで停止しています。Facebookへは何も送信していません。');
   }
   if (MODE === 'preview') return runWeeklyPreview();
+  if (MODE === 'mail-draft') return runMailDraft();
   if (MODE === 'models') return checkGeminiModels();
   return runCheck();
 }
@@ -197,7 +206,7 @@ async function runWeeklyPreview() {
   const history = loadHistory();
   // 承認済み・公開済みの日は作り直さない
   const lockedByDate = new Map(history.entries
-    .filter(e => (e.status === 'approved' || e.status === 'published') && dates.includes(e.postDate))
+    .filter(e => LOCKED_STATUSES.includes(e.status) && dates.includes(e.postDate))
     .map(e => [e.postDate, e]));
   const openDates = dates.filter(d => !lockedByDate.has(d));
 
@@ -285,6 +294,69 @@ async function runWeeklyPreview() {
       : `候補履歴に記録: ${recorded}件(${CONFIG.HISTORY_FILE})`,
     `プレビュー: ${pathToFileURL(file).href}`
   ].join('\n'));
+}
+
+// ---------------------------------------------------------------------------
+// メール承認の動作確認(1件)
+// ---------------------------------------------------------------------------
+
+/**
+ * 投稿案を1件だけ作り、署名つきで Apps Script に送る(Apps Script が保存して承認メールを送る)。
+ * - 商品の集め方・確認・投稿文の生成・事実確認は週次プレビューと同じ処理を使う
+ * - 履歴(fb-history)にある商品(承認済み・候補・公開済み・即時公開テスト・メール承認)は選ばない
+ * - 投稿案は fb-history に書かない。公開のログには投稿案ID と成否だけを出す
+ */
+async function runMailDraft() {
+  assertDataSource();
+  const apiKey = requireEnv('GEMINI_API_KEY');
+  const gasUrl = requireEnv('FB_MAIL_GAS_URL');
+  const secret = requireEnv('FB_MAIL_SECRET');
+  try {
+    checkGasUrl(gasUrl, { allowMock: IS_MOCK });
+  } catch (e) {
+    throw Object.assign(e, { public: true });
+  }
+  const today = todayJst();
+  try {
+    const history = loadHistory();
+    const blocked = new Set([
+      ...history.entries.map(e => String(e.productId)),
+      ...(history.testPosts || []).filter(t => t.result !== 'not_published').map(t => String(t.productId)),
+      ...(history.mailPosts || []).filter(t => t.result !== 'not_published').map(t => String(t.productId))
+    ]);
+    const { pool, stats } = await collectProducts(blocked);
+    const nextVerified = createVerifiedProductSource(pool, stats, []);
+    const product = await nextVerified();
+    if (!product) throw new Error('確認できた候補商品がありませんでした');
+    const phrases = recentPhrases(history, '', []);
+    const avoid = { openings: [...phrases.openings], closings: [...phrases.closings] };
+    const post = await generateForSlot(apiKey, { date: today, product, anniversary: null, assignReason: '', reserve: 0 }, nextVerified, avoid, []);
+    if (post.failed || post.needsReview || !post.ok) throw new Error(post.error || '投稿文がルール・事実確認に通りませんでした');
+    const p = post.product;
+    const source = { title: p.title, vendor: p.vendor, productType: p.productType, tags: p.tags, description: p.description };
+    const draft = {
+      productId: p.id, handle: p.handle, title: p.title, url: p.url, image: p.images[0], images: p.images,
+      message: post.message, originalHash: hashOf(post.message), postDate: today, generatedAt: new Date().toISOString(),
+      genre: p.genre, factCheck: 'passed'
+    };
+    log(`投稿案: ${p.title}(${p.id})`);
+    const reply = await callGas({ url: gasUrl, secret, action: 'createDraft', payload: { draft, source } });
+    publicLog([
+      `### 投稿案を1件作り、承認メールを送りました(投稿案ID: ${reply.draftId})`,
+      '投稿案の中身は、承認メールと承認画面でだけ確認できます(公開のログ・fb-history には残していません)。',
+      'Facebook にはまだ何も送っていません。',
+      geminiUsageSummary()
+    ].join('\n'));
+  } catch (e) {
+    quietLog.push(`エラー: ${e.message}`);
+    try {
+      await callGas({ url: gasUrl, secret, action: 'draftFailed', payload: { reason: e.message, detail: quietLog.slice(-80).join('\n') } });
+      publicLog('投稿案を作れませんでした。詳細は承認メールの宛先に送りました(Facebook には何も送っていません)。');
+    } catch (notice) {
+      publicLog(`投稿案を作れませんでした。詳細の連絡もできませんでした(${notice.message})。Facebook には何も送っていません。`);
+    }
+    throw e;
+  }
 }
 
 function resolveWeekStart() {
@@ -2155,15 +2227,29 @@ function requireEnv(name) {
 }
 
 function log(message) {
+  if (QUIET) {
+    quietLog.push(String(message));
+    return;
+  }
   console.log(message);
 }
 
 function summary(markdown) {
+  if (QUIET) {
+    quietLog.push(String(markdown));
+    return;
+  }
   console.log(markdown);
   if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, markdown + '\n');
 }
 
+/** mail-draft で公開のログに出してよい内容(投稿案の中身を含めない) */
+function publicLog(message) {
+  console.log(message);
+  if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, message + '\n');
+}
+
 main().catch(e => {
-  console.error(e.message || e);
+  console.error(QUIET && !e.public ? '投稿案を作れませんでした(詳細は公開のログに出していません)' : e.message || e);
   process.exit(1);
 });

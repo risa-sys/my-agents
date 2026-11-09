@@ -1,0 +1,35 @@
+name: Facebook mail approval - draft (fukushima-ichiba)
+
+# メール承認の動作確認用: 投稿案を1件作り、Apps Script(承認メール)に署名つきで送る。
+# - 手動実行のみ(schedule なし)。Facebook へは一切通信しない
+# - 承認前の投稿案は、公開のログ・成果物・fb-history に残さない(ログには投稿案IDと成否だけ)
+on:
+  workflow_dispatch: {}
+
+concurrency:
+  group: fb-mail-draft
+  cancel-in-progress: false
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read # 履歴は読むだけ(書き込まない)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Restore history (fb-history branch, read only)
+        run: bash scripts/fb-history-branch.sh restore
+
+      - name: Create one draft and send the approval mail
+        env:
+          MODE: mail-draft
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          FB_MAIL_GAS_URL: ${{ secrets.FB_MAIL_GAS_URL }}
+          FB_MAIL_SECRET: ${{ secrets.FB_MAIL_SECRET }}
+        run: node scripts/fb-draft-post.mjs

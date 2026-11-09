@@ -94,8 +94,33 @@ function reviewWidget(record, { blocked = false } = {}) {
     </div>`;
 }
 
-/** 画面上部の集計バーと、確認画面 */
-function reviewBar() {
+/**
+ * 画面上部の集計バーと、確認画面。
+ * mail=true はメール承認(Apps Script の承認画面)用: 「JSONを保存」の代わりに「この判断で進む」で判断を送る
+ */
+function reviewBar({ mail = false } = {}) {
+  if (mail) {
+    return `
+  <section class="panel review-bar" id="review-bar">
+    <h2>判断(承認・修正して承認・不採用=却下)</h2>
+    <p class="review-counts">読み込み中…</p>
+    <p class="meta">判断を選び、「決定内容を確認」→「この判断で進む」で判断が保存されます。
+      この時点では Facebook には投稿しません。承認した場合は、次の画面で最終的な投稿内容を確かめてから「公開する」を押したときだけ投稿します。</p>
+    <div class="review-actions">
+      <button type="button" id="review-open-confirm">決定内容を確認</button>
+      <button type="button" id="review-clear-all" class="secondary">すべてクリア</button>
+    </div>
+  </section>
+  <section class="panel review-confirm" id="review-confirm" hidden>
+    <h2>決定内容の確認</h2>
+    <div class="review-confirm-body"></div>
+    <div class="review-actions">
+      <button type="button" id="review-save-json">この判断で進む</button>
+      <button type="button" id="review-close-confirm" class="secondary">戻る</button>
+    </div>
+    <p class="meta review-saved"></p>
+  </section>`;
+  }
   return `
   <section class="panel review-bar" id="review-bar">
     <h2>判断(承認・修正・不採用)</h2>
@@ -237,7 +262,9 @@ ${rules}
     const box = document.querySelector('.review-confirm-body');
     box.innerHTML = (DATA.dataSource === 'mock' ? '<p class="ng">テスト用データの決定内容です(実際の履歴には反映できません)。</p>' : '') +
       '<table><tr><th>投稿日・商品</th><th>判断</th><th>内容(修正は 元 → 修正後 の差分)</th></tr>' + rows + '</table>' +
-      '<p class="meta">未判断の日は候補のまま残ります。保存しただけでは履歴は変わりません。</p>';
+      (DATA.mode === 'mail'
+        ? '<p class="meta">「この判断で進む」で判断が保存されます。この時点では Facebook には投稿しません。</p>'
+        : '<p class="meta">未判断の日は候補のまま残ります。保存しただけでは履歴は変わりません。</p>');
   }
 
   document.addEventListener('click', e => {
@@ -248,6 +275,8 @@ ${rules}
     if (btn.id === 'review-clear-all') { if (confirm('このページでの判断をすべて取り消しますか?(履歴には影響しません)')) { state = {}; save(); } return; }
     if (btn.id === 'review-save-json') {
       const file = buildFile();
+      // メール承認の画面では、ファイルに保存せず Apps Script に送る(送り先は画面側で用意する)
+      if (typeof window.__fbReviewSubmit === 'function') { window.__fbReviewSubmit(file); return; }
       const blob = new Blob([JSON.stringify(file, null, 2) + '\\n'], { type: 'application/json' });
       const a = document.createElement('a');
       const name = 'fb-decisions-' + DATA.week + (DATA.dataSource === 'mock' ? '-TEST' : '') + '.json';
@@ -311,4 +340,4 @@ function reviewAssets({ week, dataSource, pageId, records }) {
   };
 }
 
-export { hashOf, reviewRecordFromEntry, reviewWidget, reviewBar, reviewAssets, esc };
+export { hashOf, reviewRecordFromEntry, reviewWidget, reviewBar, reviewAssets, esc, jsonForScript, reviewScript, REVIEW_CSS };
