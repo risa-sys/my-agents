@@ -16,6 +16,9 @@
  *   mail-draft … メール承認の動作確認用。投稿案を1件だけ作り、署名つきで Apps Script(承認メール)へ送る。
  *             投稿案は公開の GitHub(fb-history・ログ・成果物)には残さない(ログには「作った/作れなかった」だけを出す)。
  *             Facebookへは一切通信しない。必要: GEMINI_API_KEY / FB_MAIL_GAS_URL / FB_MAIL_SECRET
+ *   mail-week … 7日分(1日1件・各日18:00公開予定)の投稿案を作り、まとめて Apps Script(承認メール1通)へ送る。
+ *             公開は承認済みのものだけ、予定日時に fb-mail-scheduled.yml が行う。扱いは mail-draft と同じ(Facebookへは一切通信しない)。
+ *             任意: START_DATE(YYYY-MM-DD。省略時は明日以降で、承認済み・候補・予定済みの日付と重ならない最初の7日間)
  *
  * 安全装置:
  *   - Facebook への通信はすべて guardedFacebookFetch を通す。check の GET 以外はすべて遮断する
@@ -138,10 +141,10 @@ const STYLE_REFERENCE = `🍂 会津の秋の味覚「会津みしらず柿」
 
 季節限定の味わいをぜひお楽しみください♪`;
 
-const MODES = ['preview', 'models', 'check', 'draft', 'mail-draft'];
+const MODES = ['preview', 'models', 'check', 'draft', 'mail-draft', 'mail-week'];
 const MODE = process.env.MODE || 'preview';
 // mail-draft では、承認前の投稿案(商品名・本文)を公開のログに出さない。途中経過はメモリにだけ残し、失敗したときだけ承認メールの宛先に送る
-const QUIET = MODE === 'mail-draft';
+const QUIET = MODE === 'mail-draft' || MODE === 'mail-week';
 const quietLog = [];
 const IS_MOCK = CONFIG.DATA_SOURCE === 'mock';
 const IMAGE_HOSTS = IS_MOCK ? CONFIG.MOCK_IMAGE_HOSTS : CONFIG.IMAGE_HOSTS;
@@ -159,6 +162,7 @@ async function main() {
   }
   if (MODE === 'preview') return runWeeklyPreview();
   if (MODE === 'mail-draft') return runMailDraft();
+  if (MODE === 'mail-week') return runMailWeek();
   if (MODE === 'models') return checkGeminiModels();
   return runCheck();
 }
@@ -357,6 +361,109 @@ async function runMailDraft() {
     }
     throw e;
   }
+}
+
+// ---------------------------------------------------------------------------
+// メール承認の7日分(1日1件・各日18:00公開予定)
+// ---------------------------------------------------------------------------
+
+/**
+ * 7日分の投稿案を作り、まとめて Apps Script に送る(承認メールは1通・投稿案ごとに承認画面)。
+ * - 選ばない商品: fb-history の全記録(承認済み・候補・公開済み)・即時公開テスト・メール承認の公開・Apps Script にある投稿案
+ * - 日付: fb-history の記録がある日・Apps Script で公開予定の日とは重ねない
+ * - 7件そろわなければ送らない(失敗として承認メールの宛先に知らせる)
+ */
+async function runMailWeek() {
+  assertDataSource();
+  const apiKey = requireEnv('GEMINI_API_KEY');
+  const gasUrl = requireEnv('FB_MAIL_GAS_URL');
+  const secret = requireEnv('FB_MAIL_SECRET');
+  try {
+    checkGasUrl(gasUrl, { allowMock: IS_MOCK });
+  } catch (e) {
+    throw Object.assign(e, { public: true });
+  }
+  try {
+    const history = loadHistory();
+    const active = await callGas({ url: gasUrl, secret, action: 'activeProducts' });
+    const blocked = new Set([
+      ...history.entries.map(e => String(e.productId)),
+      ...(history.testPosts || []).filter(t => t.result !== 'not_published').map(t => String(t.productId)),
+      ...(history.mailPosts || []).filter(t => t.result !== 'not_published').map(t => String(t.productId)),
+      ...(active.productIds || []).map(String)
+    ]);
+    const usedDates = new Set([
+      ...history.entries.filter(e => e.status !== 'rejected').map(e => e.postDate),
+      ...(active.scheduledDates || [])
+    ]);
+    const dates = mailWeekDates(usedDates);
+    log(`公開予定日: ${dates[0]} 〜 ${dates.at(-1)}(各日 18:00)`);
+    const { pool, stats } = await collectProducts(blocked);
+    const nextVerified = createVerifiedProductSource(pool, stats, []);
+    const phrases = recentPhrases(history, '', []);
+    const avoid = { openings: [...phrases.openings], closings: [...phrases.closings] };
+    const posts = [];
+    for (const [i, date] of dates.entries()) {
+      const product = await nextVerified();
+      if (!product) throw new Error(`${date}: 確認できた候補商品が足りませんでした(${posts.length}件まで作成)`);
+      const post = await generateForSlot(apiKey, { date, product, anniversary: null, assignReason: '', reserve: dates.length - i - 1 }, nextVerified, avoid, posts);
+      if (post.failed || post.needsReview || !post.ok) throw new Error(`${date}: ${post.error || '投稿文がルール・事実確認に通りませんでした'}(${posts.length}件まで作成)`);
+      avoid.openings.push(post.opening);
+      avoid.closings.push(post.closing);
+      posts.push(post);
+      log(`${date}: ${post.product.title}(${post.product.id})`);
+    }
+    const ids = posts.map(p => String(p.product.id));
+    if (new Set(ids).size !== ids.length) throw new Error('同じ商品が2回選ばれました');
+    const generatedAt = new Date().toISOString();
+    const items = posts.map(post => {
+      const p = post.product;
+      return {
+        draft: {
+          productId: p.id, handle: p.handle, title: p.title, url: p.url, image: p.images[0],
+          message: post.message, originalHash: hashOf(post.message), postDate: post.date, generatedAt, genre: p.genre, factCheck: 'passed'
+        },
+        source: { title: p.title, vendor: p.vendor, productType: p.productType, tags: p.tags, description: p.description }
+      };
+    });
+    const reply = await callGas({ url: gasUrl, secret, action: 'createBatch', payload: { items } });
+    publicLog([
+      `### 7日分の投稿案を作り、承認メールを送りました(まとめID: ${reply.batchId})`,
+      `公開予定: ${dates[0]} 〜 ${dates.at(-1)} の各日 18:00(日本時間)。承認済みのものだけが公開対象です`,
+      '投稿案の中身は、承認メールと承認画面でだけ確認できます(公開のログ・fb-history には残していません)。',
+      'Facebook にはまだ何も送っていません。',
+      geminiUsageSummary()
+    ].join('\n'));
+  } catch (e) {
+    quietLog.push(`エラー: ${e.message}`);
+    try {
+      await callGas({ url: gasUrl, secret, action: 'draftFailed', payload: { reason: `7日分の投稿案: ${e.message}`, detail: quietLog.slice(-80).join('\n') } });
+      publicLog('投稿案を作れませんでした。詳細は承認メールの宛先に送りました(Facebook には何も送っていません)。');
+    } catch (notice) {
+      publicLog(`投稿案を作れませんでした。詳細の連絡もできませんでした(${notice.message})。Facebook には何も送っていません。`);
+    }
+    throw e;
+  }
+}
+
+/** 公開予定の7日間。START_DATE が無ければ、明日以降で使用中の日付と重ならない最初の7日間 */
+function mailWeekDates(usedDates) {
+  const tomorrow = addDays(todayJst(), 1);
+  const span = start => Array.from({ length: CONFIG.DAYS_PER_BATCH }, (_, i) => addDays(start, i));
+  const value = process.env.START_DATE;
+  if (value) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value) || Number.isNaN(Date.parse(`${value}T00:00:00Z`))) throw new Error(`START_DATE は YYYY-MM-DD 形式で指定してください(指定値: ${value})`);
+    if (value < tomorrow) throw new Error(`START_DATE は明日(${tomorrow})以降にしてください`);
+    const dates = span(value);
+    const clash = dates.filter(d => usedDates.has(d));
+    if (clash.length) throw new Error(`すでに投稿予定・記録がある日付と重なります: ${clash.join(', ')}`);
+    return dates;
+  }
+  for (let start = tomorrow, n = 0; n < 120; n++, start = addDays(start, 1)) {
+    const dates = span(start);
+    if (!dates.some(d => usedDates.has(d))) return dates;
+  }
+  throw new Error('使用中の日付と重ならない7日間が見つかりませんでした');
 }
 
 function resolveWeekStart() {

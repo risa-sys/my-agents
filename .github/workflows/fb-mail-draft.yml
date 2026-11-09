@@ -1,10 +1,22 @@
 name: Facebook mail approval - draft (fukushima-ichiba)
 
-# メール承認の動作確認用: 投稿案を1件作り、Apps Script(承認メール)に署名つきで送る。
+# メール承認: 投稿案を作り、Apps Script(承認メール)に署名つきで送る。
+# - kind=week … 7日分(1日1件・各日18:00公開予定)をまとめて送る(承認メール1通)。start_date 空欄なら自動で決める
+# - kind=one  … 動作確認用に1件だけ送る(「公開する」で即時公開)
 # - 手動実行のみ(schedule なし)。Facebook へは一切通信しない
 # - 承認前の投稿案は、公開のログ・成果物・fb-history に残さない(ログには投稿案IDと成否だけ)
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: "week=7日分 / one=1件(動作確認)"
+        type: choice
+        options: [week, one]
+        default: week
+      start_date:
+        description: "7日分の最初の公開予定日(YYYY-MM-DD・日本時間)。空欄なら明日以降で予定・記録と重ならない最初の7日間"
+        type: string
+        required: false
 
 concurrency:
   group: fb-mail-draft
@@ -13,7 +25,7 @@ concurrency:
 jobs:
   draft:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: read # 履歴は読むだけ(書き込まない)
     steps:
@@ -26,9 +38,10 @@ jobs:
       - name: Restore history (fb-history branch, read only)
         run: bash scripts/fb-history-branch.sh restore
 
-      - name: Create one draft and send the approval mail
+      - name: Create drafts and send the approval mail
         env:
-          MODE: mail-draft
+          MODE: ${{ inputs.kind == 'one' && 'mail-draft' || 'mail-week' }}
+          START_DATE: ${{ inputs.start_date }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           FB_MAIL_GAS_URL: ${{ secrets.FB_MAIL_GAS_URL }}
           FB_MAIL_SECRET: ${{ secrets.FB_MAIL_SECRET }}

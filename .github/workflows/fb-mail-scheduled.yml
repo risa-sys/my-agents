@@ -1,0 +1,50 @@
+name: Facebook mail approval - scheduled publish (fukushima-ichiba)
+
+# 7日分のメール承認の投稿を、各日 18:00(日本時間)に1件だけ公開する。
+# - 公開するのは、承認画面で「承認」「修正して承認」された、その日の投稿案だけ(未承認・却下は公開しない)
+# - 公開の直前に、承認内容・投稿先・商品(販売中・商品ID・画像)・同じ商品/同じ日付の記録を確かめ直す
+# - 実際に投稿するのは、リポジトリの変数 FB_MAIL_PUBLISH_ENABLED が true のときだけ。それ以外は確認だけ
+# - GitHub Actions の schedule は UTC。09:00 UTC = 18:00 JST。開始の遅れに備えて 17:45 JST に起動し、
+#   スクリプトが 18:00 まで待ってから公開する(18:10 / 18:40 は遅延・失敗に備えた予備。公開済みなら何もしない)
+# - 定時実行は、7件の内容と公開予定日時の確認が終わるまで無効(下の schedule はコメントのまま)
+on:
+  # schedule:
+  #   - cron: "45 8 * * *"  # 17:45 JST 起動 → 18:00 まで待って公開
+  #   - cron: "10 9 * * *"  # 18:10 JST 予備
+  #   - cron: "40 9 * * *"  # 18:40 JST 予備
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "公開予定日(YYYY-MM-DD・日本時間)。空欄なら今日。18:00 前なら 18:00 まで待つ(30分以上前なら何もしない)"
+        type: string
+        required: false
+
+concurrency:
+  group: fb-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write # fb-history の mailPosts への記録(main には書き込まない)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Publish today's approved post
+        env:
+          DATE: ${{ inputs.date }}
+          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+          FB_PAGE_ACCESS_TOKEN: ${{ secrets.FB_PAGE_ACCESS_TOKEN }}
+          FB_MAIL_GAS_URL: ${{ secrets.FB_MAIL_GAS_URL }}
+          FB_MAIL_SECRET: ${{ secrets.FB_MAIL_SECRET }}
+          FB_MAIL_PUBLISH_ENABLED: ${{ vars.FB_MAIL_PUBLISH_ENABLED }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          if [ -n "$DATE" ]; then node scripts/fb-mail-publish.mjs scheduled --date "$DATE"; else node scripts/fb-mail-publish.mjs scheduled; fi

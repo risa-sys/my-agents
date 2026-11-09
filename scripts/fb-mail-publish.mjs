@@ -12,12 +12,20 @@
  *
  * 公開のログには、公開前の投稿案の中身(本文・商品名)を出さない(詳細は承認メールの宛先にだけ送る)。
  * 毎日の予約投稿(fb-publish.mjs)には組み込まない。
+ *
+ * 7日分(予定日時に自動公開):
+ *   node scripts/fb-mail-publish.mjs scheduled [--date YYYY-MM-DD]
+ *   fb-mail-scheduled.yml が毎日 18:00(日本時間)前後に実行する。18:00 より前に起動したら 18:00 まで待つ。
+ *   その日の投稿案を Apps Script から受け取り(承認済みだけ・1回だけ)、上と同じ確認をしてから1件だけ公開する。
+ *   未承認は Apps Script が「確認待ち」にして知らせる。18:00 から2時間を過ぎたら公開しない。
+ *   公開するのは FB_MAIL_PUBLISH_ENABLED=true のときだけ(それ以外は確認のみ)。
  */
 import { appendFileSync } from 'node:fs';
 import { checkEdit, splitMessage } from './fb-review-rules.mjs';
 import { hashOf } from './fb-review-ui.mjs';
 import { createHistoryStore } from './fb-history-store.mjs';
 import { callGas, checkGasUrl } from './fb-mail-sign.mjs';
+import { jstDate, jstAt } from './fb-publish-core.mjs';
 import {
   TEST, REMOTE, BRANCH, now, setupProblems, contentHash, validateContent, shopAvailable, createImmediateGraph, publishOnce
 } from './fb-immediate.mjs';
@@ -54,17 +62,77 @@ function checkApproved(c, draftId, pageId) {
   return errors;
 }
 
-async function cmdPublish(draftId) {
+function setup() {
   const token = process.env.FB_PAGE_ACCESS_TOKEN;
   const pageId = String(process.env.FB_PAGE_ID || '');
   const gasUrl = process.env.FB_MAIL_GAS_URL || '';
   const secret = process.env.FB_MAIL_SECRET || '';
   const enabled = process.env.FB_MAIL_PUBLISH_ENABLED === 'true';
-  if (!/^[0-9a-f]{32}$/.test(String(draftId))) throw new Error('投稿案IDが不正です');
   if (!token || !/^\d+$/.test(pageId)) throw new Error('FB_PAGE_ACCESS_TOKEN / FB_PAGE_ID がありません');
   if (!secret) throw new Error('FB_MAIL_SECRET がありません');
   checkGasUrl(gasUrl, { allowLoopback: TEST });
   const gas = (action, payload) => callGas({ url: gasUrl, secret, action, payload, now });
+  return { token, pageId, enabled, gas };
+}
+
+async function cmdPublish(draftId) {
+  if (!/^[0-9a-f]{32}$/.test(String(draftId))) throw new Error('投稿案IDが不正です');
+  const ctx = setup();
+  log(`### メール承認からの公開(投稿案ID: ${draftId})${ctx.enabled ? '' : ' — 確認のみ(FB_MAIL_PUBLISH_ENABLED が true ではないため投稿しません)'}`);
+  // 1. 承認済みの内容を受け取る(1回だけ)
+  let c;
+  try {
+    c = (await ctx.gas('getApproved', { draftId })).content;
+  } catch (e) {
+    throw new Error(`承認済みの内容を受け取れなかったため、何も送っていません: ${e.message}`);
+  }
+  await publishApproved(ctx, c, draftId);
+}
+
+const SCHEDULE_CLOCK = '18:00';
+const MAX_WAIT_MS = 30 * 60 * 1000; // 18:00 より前に起動したときに待つ上限
+
+/** 予定日時の公開(7日分)。その日の承認済みの投稿案だけを公開する */
+async function cmdScheduled(dateArg) {
+  const date = dateArg || jstDate(now());
+  if (!/^d{4}-d{2}-d{2}$/.test(date)) throw new Error('日付が不正です');
+  const ctx = setup();
+  const at = jstAt(date, SCHEDULE_CLOCK);
+  log(`### 予定日時の公開(${date} ${SCHEDULE_CLOCK} 日本時間)${ctx.enabled ? '' : ' — 確認のみ(FB_MAIL_PUBLISH_ENABLED が true ではないため投稿しません)'}`);
+  const wait = at - now();
+  if (wait > MAX_WAIT_MS) {
+    log('公開予定時刻より前のため、何もしません');
+    return;
+  }
+  if (wait > 0) {
+    log(`公開予定時刻まで ${Math.ceil(wait / 1000)} 秒待ちます`);
+    await new Promise(r => setTimeout(r, wait + 1000));
+  }
+  let reply;
+  try {
+    reply = await ctx.gas('claimScheduled', { postDate: date });
+  } catch (e) {
+    throw new Error(`予定の投稿案を受け取れなかったため、何も送っていません: ${e.message}`);
+  }
+  const notes = {
+    none: 'この日の公開予定の投稿案はありません',
+    rejected: 'この日の投稿案は却下されているため、公開しません',
+    not_approved: '予定時刻までに承認されなかったため公開しません(確認待ち。メールで知らせました)',
+    too_late: '公開予定時刻から時間がたちすぎたため公開しません(メールで知らせました)',
+    too_early: '公開予定時刻より前のため、何もしません',
+    already: `この日の投稿案はすでに処理済みです(${reply.state || ''})`
+  };
+  if (reply.status !== 'claimed') {
+    log(notes[reply.status] || `公開しません(${reply.status})`);
+    return;
+  }
+  const c = reply.content;
+  if (c.postDate !== date || Number(c.scheduledAt) !== at) throw new Error('受け取った投稿案の公開予定が一致しません(何も送っていません)');
+  await publishApproved(ctx, c, c.draftId, { postDate: date, scheduled: true });
+}
+
+/** 受け取った承認済みの内容を確かめ、1件だけ公開する(FB_MAIL_PUBLISH_ENABLED が true でなければ確認のみ) */
+async function publishApproved({ token, pageId, enabled, gas }, c, draftId, extra = {}) {
   const report = async (result, fields = {}) => {
     try {
       await gas('report', { draftId, result, runUrl, ...fields });
@@ -73,14 +141,6 @@ async function cmdPublish(draftId) {
     }
   };
 
-  log(`### メール承認からの公開(投稿案ID: ${draftId})${enabled ? '' : ' — 確認のみ(FB_MAIL_PUBLISH_ENABLED が true ではないため投稿しません)'}`);
-  // 1. 承認済みの内容を受け取る(1回だけ)
-  let c;
-  try {
-    c = (await gas('getApproved', { draftId })).content;
-  } catch (e) {
-    throw new Error(`承認済みの内容を受け取れなかったため、何も送っていません: ${e.message}`);
-  }
   const content = { productId: String(c.productId), url: c.url, image: c.image, message: c.message };
 
   const store = createHistoryStore({ remote: REMOTE, branch: BRANCH, dryRun: !enabled, log });
@@ -91,6 +151,13 @@ async function cmdPublish(draftId) {
     errors.push(...validateContent(content, history));
     const same = (history.mailPosts || []).filter(t => t.draftId === draftId && t.result !== 'not_published');
     if (same.length) errors.push(`この投稿案はすでに公開処理の記録があります(${same.map(t => `${t.at} ${t.result}`).join(', ')})。二度目は送りません`);
+    if (extra.postDate) {
+      // 同じ日付への二重投稿を防ぐ(7日分の公開・毎日の予約投稿の記録)
+      const sameDay = (history.mailPosts || []).filter(t => t.scheduled && t.postDate === extra.postDate && t.result !== 'not_published');
+      if (sameDay.length) errors.push(`${extra.postDate} はすでに予定日時の公開の記録があります。二度目は送りません`);
+      const daily = history.entries.filter(e => e.postDate === extra.postDate && !['candidate', 'rejected'].includes(e.status));
+      if (daily.length) errors.push(`${extra.postDate} には毎日の予約投稿の記録(${daily.map(e => e.status).join(', ')})があります。同じ日には公開しません`);
+    }
     if (errors.length) throw new Refusal(errors.join(' / '));
     const shop = await shopAvailable(content);
     if (shop) throw new Refusal(`商品の確認NG: ${shop}`);
@@ -107,7 +174,7 @@ async function cmdPublish(draftId) {
     // 3. 1件だけ公開(送る前に記録・応答が途切れても送り直さない)
     let r;
     try {
-      r = await publishOnce({ graph: g, content, hash: c.hash, pageId, store, listKey: 'mailPosts', record: { draftId }, log });
+      r = await publishOnce({ graph: g, content, hash: c.hash, pageId, store, listKey: 'mailPosts', record: { draftId, ...extra }, log });
     } catch (e) {
       // 送ったか分からないときは「要確認」にする(自動では送り直さない)
       e.result = e.result || 'unknown';
@@ -132,7 +199,8 @@ try {
   const problems = setupProblems();
   if (problems.length) throw new Error(problems.join('\n'));
   if (cmd === 'publish' && flag === '--draft') await cmdPublish(draftId);
-  else throw new Error('使い方: node scripts/fb-mail-publish.mjs publish --draft <投稿案ID>');
+  else if (cmd === 'scheduled' && (!flag || flag === '--date')) await cmdScheduled(draftId || '');
+  else throw new Error('使い方: node scripts/fb-mail-publish.mjs publish --draft <投稿案ID> / scheduled [--date YYYY-MM-DD]');
 } catch (e) {
   log(`エラー: ${e.message}`);
   process.exitCode = 1;
