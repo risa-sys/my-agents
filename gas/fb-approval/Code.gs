@@ -367,14 +367,16 @@ function takeApproved_(d) {
 /** 投稿案のある商品と、公開予定(終わっていないもの)の日付。7日分を作るときに重ならないようにする */
 function apiActiveProducts_() {
   const productIds = [];
+  const titles = [];
   const scheduledDates = [];
   for (const id of draftIds_()) {
     const d = loadDraft_(id);
     if (!d) continue;
     productIds.push(String(d.productId));
+    titles.push(String(d.title));
     if (d.scheduledAt && SCHEDULED_DONE_STATES.indexOf(stateOf_(d)) < 0) scheduledDates.push(d.postDate);
   }
-  return { ok: true, productIds: productIds, scheduledDates: scheduledDates };
+  return { ok: true, productIds: productIds, titles: titles, scheduledDates: scheduledDates };
 }
 
 function apiCreateBatch_(req, cfg) {

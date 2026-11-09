@@ -398,7 +398,16 @@ async function runMailWeek() {
     ]);
     const dates = mailWeekDates(usedDates);
     log(`公開予定日: ${dates[0]} 〜 ${dates.at(-1)}(各日 18:00)`);
-    const { pool, stats } = await collectProducts(blocked);
+    const { pool: allPool, stats } = await collectProducts(blocked);
+    // 名前がほぼ同じ商品(例: 会津みしらず柿の別の規格・銘柄)は、使用済みのものと重ねず、7件の中でも1つだけにする
+    const usedTitles = [...history.entries.map(e => e.title), ...(active.titles || [])].filter(Boolean).map(titleCore);
+    const pool = [];
+    for (const p of allPool) {
+      const core = titleCore(p.title);
+      if ([...usedTitles, ...pool.map(x => titleCore(x.title))].some(t => similarTitle(core, t))) continue;
+      pool.push(p);
+    }
+    log(`名前が近い商品を除いた候補: ${pool.length}件`);
     const nextVerified = createVerifiedProductSource(pool, stats, []);
     const phrases = recentPhrases(history, '', []);
     const avoid = { openings: [...phrases.openings], closings: [...phrases.closings] };
@@ -444,6 +453,26 @@ async function runMailWeek() {
     }
     throw e;
   }
+}
+
+/** 商品名の中心部分(【】・()内・数量・単位・記号・空白を除く) */
+function titleCore(title) {
+  return String(title || '').normalize('NFKC')
+    .replace(/【[^】]*】|\[[^\]]*\]|\([^)]*\)|（[^）]*）|「|」/g, '')
+    .replace(/[0-9０-９.,]+\s*(kg|g|ml|l|本|個|袋|箱|枚|入り?|セット|パック|合|升)?/gi, '')
+    .replace(/[\s・×x＆&,、。!！?？\-ー~〜/／]+/g, '')
+    .toLowerCase();
+}
+
+/** 名前がほぼ同じか(短い方の2文字の組の6割以上が、もう一方にもある) */
+function similarTitle(a, b) {
+  if (a.length < 3 || b.length < 3) return a === b;
+  const grams = s => new Set(Array.from({ length: s.length - 1 }, (_, i) => s.slice(i, i + 2)));
+  const x = grams(a);
+  const y = grams(b);
+  let inter = 0;
+  for (const g of x) if (y.has(g)) inter++;
+  return inter / Math.min(x.size, y.size) >= 0.6;
 }
 
 /** 公開予定の7日間。START_DATE が無ければ、明日以降で使用中の日付と重ならない最初の7日間 */
