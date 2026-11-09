@@ -1,0 +1,65 @@
+name: Facebook one-time test post (fukushima-ichiba)
+
+# 本番ページへの「1件だけの即時公開テスト」専用。毎日の予約投稿(fb-publish.yml)とは別。
+# - 手動実行のみ(schedule なし)
+# - check: 投稿先のページID・ページ名と、公開予定の商品(販売状況・商品ID・画像の紐づけ)の読み取りだけ
+# - publish: data/fb-test-post.json の内容を1件だけ即時公開する。
+#   confirm_page_id(ページID)・confirm_hash(内容のハッシュ)・confirm_text(「今すぐ公開する」)が
+#   すべて一致しないと何も送らない。テスト投稿は1回だけ(fb-history の testPosts に記録)
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "check=投稿先のページの確認(読み取りのみ) / publish=1件だけ即時公開"
+        type: choice
+        options: [check, publish]
+        default: check
+      confirm_page_id:
+        description: "publish のみ: 投稿先のページID(check で表示されたもの)"
+        type: string
+        required: false
+        default: ""
+      confirm_hash:
+        description: "publish のみ: 承認した内容のハッシュ(npm run fb:test-plan で表示されたもの)"
+        type: string
+        required: false
+        default: ""
+      confirm_text:
+        description: "publish のみ: 「今すぐ公開する」と入力"
+        type: string
+        required: false
+        default: ""
+
+concurrency:
+  group: fb-publish
+  cancel-in-progress: false
+
+jobs:
+  test-post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # fb-history の testPosts への記録(main には書き込まない)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run (${{ inputs.mode }})
+        env:
+          MODE: ${{ inputs.mode }}
+          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+          FB_PAGE_ACCESS_TOKEN: ${{ secrets.FB_PAGE_ACCESS_TOKEN }}
+          FB_TEST_CONFIRM_PAGE_ID: ${{ inputs.confirm_page_id }}
+          FB_TEST_CONFIRM_HASH: ${{ inputs.confirm_hash }}
+          FB_TEST_CONFIRM_TEXT: ${{ inputs.confirm_text }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          case "$MODE" in
+            check) node scripts/fb-test-publish.mjs check data/fb-test-post.json ;;
+            publish) node scripts/fb-test-publish.mjs publish data/fb-test-post.json ;;
+            *) echo "不明なモード: $MODE"; exit 1 ;;
+          esac
