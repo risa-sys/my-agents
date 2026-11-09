@@ -248,6 +248,7 @@ function handleApi_(req, cfg) {
   if (req.action === 'createBatch') return apiCreateBatch_(req, cfg);
   if (req.action === 'claimScheduled') return apiClaimScheduled_(req, cfg);
   if (req.action === 'reschedule') return apiReschedule_(req, cfg);
+  if (req.action === 'resendBatch') return apiResendBatch_(req, cfg);
   throw apiError_('不明な要求です', 'unknown_action');
 }
 
@@ -493,6 +494,34 @@ function apiReschedule_(req, cfg) {
 }
 
 /**
+ * 7日分の承認メールを送り直す(内容・日付・判断はそのまま)。承認画面のリンクの鍵は作り直す(古いメールのリンクは使えなくなる)。
+ */
+function apiResendBatch_(req, cfg) {
+  if (!cfg.owner || !cfg.uiUrl) throw apiError_('OWNER_EMAIL / UI_URL が設定されていません', 'not_configured');
+  const batchId = String(req.batchId || '');
+  if (!/^[0-9a-f]{32}$/.test(batchId)) throw apiError_('まとめIDが不正です', 'invalid');
+  return withLock_(() => {
+    const batch = draftIds_().map(loadDraft_).filter(d => d && d.batchId === batchId).sort((a, b) => a.scheduledAt - b.scheduledAt);
+    if (!batch.length) throw apiError_('まとめが見つかりません', 'not_found');
+    const backup = batch.map(d => JSON.stringify(d));
+    const saved = batch.map(d => {
+      const key = randomHex_() + randomHex_();
+      d.keyHash = sha256Hex_(key);
+      event_(d, '承認メールを送り直しました(承認画面のリンクを作り直しました)');
+      return { d: d, key: key };
+    });
+    try {
+      saved.forEach(x => saveDraft_(x.d));
+      sendBatchMail_(saved, cfg, { resent: true });
+    } catch (err) {
+      backup.forEach(json => saveDraft_(JSON.parse(json)));
+      throw apiError_('承認メールを送り直せませんでした(元に戻しました): ' + err.message, 'mail_failed');
+    }
+    return { ok: true, batchId: batchId, items: saved.map(x => ({ draftId: x.d.id, postDate: x.d.postDate, state: stateOf_(x.d) })) };
+  });
+}
+
+/**
  * 予定日時の公開処理(fb-mail-scheduled.yml)が、その日の投稿案を受け取る。
  * 承認済みだけを渡す。未判断は「確認待ち」にして知らせ、却下・終わったものは渡さない。
  */
@@ -586,6 +615,9 @@ function sendDraftMail_(d, key, cfg) {
 
 function sendBatchMail_(saved, cfg, opts) {
   const re = !!(opts && opts.rescheduled);
+  const resent = !!(opts && opts.resent);
+  const btn = (href, label, color) => '<a href="' + esc(href) + '" style="display:inline-block;background:' + color + ';color:#fff;padding:8px 14px;border-radius:6px;text-decoration:none;font-weight:bold;margin:0 6px 6px 0">' + label + '</a>';
+  const overview = cfg.uiUrl + '?b=' + (saved[0].d.batchId || '');
   const first = saved[0].d;
   const last = saved[saved.length - 1].d;
   const range = Utilities.formatDate(new Date(first.scheduledAt), 'Asia/Tokyo', 'M/d') + '〜' + Utilities.formatDate(new Date(last.scheduledAt), 'Asia/Tokyo', 'M/d');
@@ -594,29 +626,34 @@ function sendBatchMail_(saved, cfg, opts) {
   saved.forEach((s, i) => {
     const d = s.d;
     const link = cfg.uiUrl + '?d=' + d.id + '&k=' + s.key;
-    const st = re && d.state !== 'awaiting' ? '(現在: ' + (STATE_LABELS[d.state] || d.state) + ')' : '';
-    text.push('■ ' + (i + 1) + '. 公開予定 ' + scheduleLabel_(d) + st, '商品: ' + d.title, '商品URL: ' + d.url, '画像: ' + d.image, '--- 投稿文 ---', d.message, '承認画面を開く: ' + link, '');
+    const st = stateOf_(d) !== 'awaiting' ? '(現在: ' + (STATE_LABELS[stateOf_(d)] || d.state) + ')' : '';
+    text.push('■ ' + (i + 1) + '. 公開予定 ' + scheduleLabel_(d) + st, '商品: ' + d.title, '商品URL: ' + d.url, '画像: ' + d.image, '--- 投稿文 ---', d.message, '承認する: ' + link + '&a=approve', '修正する: ' + link + '&a=edit', '却下する: ' + link + '&a=reject', '');
     html +=
       '<div style="border:1px solid #ced0d4;border-radius:8px;padding:12px;margin:0 0 20px">' +
       '<p style="margin:0 0 6px;font-size:15px"><b>' + (i + 1) + '. 公開予定 ' + esc(scheduleLabel_(d)) + '</b>' + (st ? ' <span style="color:#1a7f37">' + esc(st) + '</span>' : '') + '</p>' +
       '<p style="margin:0 0 8px"><b>' + esc(d.title) + '</b><br><a href="' + esc(d.url) + '">' + esc(d.url) + '</a></p>' +
       '<p style="margin:0 0 8px"><img src="' + esc(imageUrl_(d.image, 600)) + '" alt="' + esc(d.title) + '" width="240" style="max-width:100%;height:auto;border-radius:6px"></p>' +
       '<div style="background:#f7f8fa;border-radius:6px;padding:10px">' + messageHtml_(d.message, d.url) + '</div>' +
-      '<p style="margin:12px 0 0"><a href="' + esc(link) + '" style="display:inline-block;background:#1877f2;color:#fff;padding:8px 16px;border-radius:6px;text-decoration:none;font-weight:bold">承認画面を開く</a></p></div>';
+      '<p style="margin:12px 0 0">' + btn(link + '&a=approve', '承認する', '#1877f2') + btn(link + '&a=edit', '修正する', '#5b6b7f') + btn(link + '&a=reject', '却下する', '#c62828') + '</p>' +
+      '<p style="margin:0;font-size:12px;color:#65676b">ボタンを押すと確認画面が開きます。確認画面で確定するまで、判断は決まりません。</p></div>';
   });
   const note = '承認(または修正して承認)した投稿だけを、それぞれの公開予定日時に自動で公開します。却下・未判断の投稿は公開しません。' +
     '判断は各投稿の公開予定時刻まで変更できます。予定時刻までに判断がない投稿は「確認待ち」になり、公開しません。';
-  const reNote = re ? '公開予定日を変更しました。商品・投稿文・画像は前回のメールと同じで、すでにした判断(承認・修正して承認・却下)は引き継いでいます。前回のメールのリンクは使えなくなりました。このメールのリンクから確認してください。' : '';
+  const reNote = re ? '公開予定日を変更しました。商品・投稿文・画像は前回のメールと同じで、すでにした判断(承認・修正して承認・却下)は引き継いでいます。前回のメールのリンクは使えなくなりました。このメールのリンクから確認してください。'
+    : resent ? '操作しやすい形式で送り直しました。商品・投稿文・画像・公開予定日は前回のメールと同じで、すでにした判断は引き継いでいます。前回のメールのリンクは使えなくなりました。このメールのボタンから操作してください。' : '';
+  const how = '各投稿の「承認する」「修正する」「却下する」を押すと確認画面が開きます。確認画面で「この判断で確定する」を押したときだけ判断が保存されます(メールのボタンを押しただけでは何も決まりません)。';
   MailApp.sendEmail({
     to: cfg.owner,
-    subject: '[ふくしま市場] ' + (re ? '【公開日変更】' : '') + '7日分の投稿案の承認のお願い(' + range + ' 各日' + APP.SCHEDULE_TIME + ')',
+    subject: '[ふくしま市場] ' + (re ? '【公開日変更】' : resent ? '【再送】' : '') + '7日分の投稿案の承認のお願い(' + range + ' 各日' + APP.SCHEDULE_TIME + ')',
     name: 'ふくしま市場 投稿承認',
-    body: ['Facebook 投稿案7日分の承認をお願いします(まだ投稿していません)。'].concat(reNote ? [reNote] : []).concat([note, '投稿先: ' + APP.PAGE_NAME + '(ページID ' + APP.PAGE_ID + ')', '']).concat(text).join('\n'),
+    body: ['Facebook 投稿案7日分の承認をお願いします(まだ投稿していません)。'].concat(reNote ? [reNote] : []).concat([how, note, '7件の状態(承認済み・却下など)の一覧: ' + overview, '投稿先: ' + APP.PAGE_NAME + '(ページID ' + APP.PAGE_ID + ')', '']).concat(text).join('\n'),
     htmlBody:
       '<div style="font-family:sans-serif;max-width:640px;line-height:1.6">' +
       '<p>Facebook 投稿案<b>7日分</b>の承認をお願いします(<b>まだ投稿していません</b>)。</p>' +
       (reNote ? '<p style="background:#fff4e5;border-radius:6px;padding:8px 10px"><b>' + esc(reNote) + '</b></p>' : '') +
+      '<p style="font-size:14px"><b>' + esc(how) + '</b></p>' +
       '<p style="font-size:13px;color:#444">' + esc(note) + '</p>' +
+      '<p style="font-size:13px"><a href="' + esc(overview) + '">7件の状態(承認済み・却下など)を一覧で見る</a></p>' +
       '<p style="font-size:13px;color:#65676b">投稿先: ' + esc(APP.PAGE_NAME) + '(ページID ' + APP.PAGE_ID + ')</p>' + html +
       '<p style="color:#65676b;font-size:13px">承認画面は、このプロジェクトの所有者の Google アカウントでログインしているときだけ開けます。画面を開いただけでは何も変わりません。<br>' +
       'このメールを転送しないでください(リンクに承認用の鍵が含まれています)。</p></div>'
@@ -680,9 +717,13 @@ function doGet(e) {
   const cfg = config_();
   if (!isOwner_(cfg)) return page_('表示できません', '<p>このページは表示できません。</p>');
   const p = (e && e.parameter) || {};
+  // 一覧(表示だけ。判断はできない)
+  if (p.b) return batchOverview_(String(p.b));
+  // 画面を開いただけ(GET)では何も保存しない。a は画面で最初に開く操作の指定だけ
+  const intent = ['approve', 'edit', 'reject'].indexOf(p.a) >= 0 ? p.a : '';
   const d = authorizeDraft_(p.d, p.k);
   if (!d) return page_('リンクが無効です', '<p class="ng">リンクが無効です(投稿案が見つからないか、リンクの鍵が一致しません)。</p>');
-  return page_('投稿案の承認', draftPageHtml_(d, p.k));
+  return page_('投稿案の承認', draftPageHtml_(d, p.k, intent));
 }
 
 function finalView_(d) {
@@ -697,7 +738,21 @@ function statusView_(d) {
   return { state: state, label: STATE_LABELS[state] || state, result: d.result || null, final: d.state === 'decided' ? finalView_(d) : null };
 }
 
-function draftPageHtml_(d, key) {
+function batchOverview_(batchId) {
+  if (!/^[0-9a-f]{32}$/.test(batchId)) return page_('リンクが無効です', '<p class="ng">リンクが無効です。</p>');
+  const list = draftIds_().map(loadDraft_).filter(d => d && d.batchId === batchId).sort((a, b) => a.scheduledAt - b.scheduledAt);
+  if (!list.length) return page_('見つかりません', '<p class="ng">投稿案が見つかりません。</p>');
+  const rows = list.map(d => {
+    const st = stateOf_(d);
+    const cls = st === 'decided' || st === 'published' ? 'ok' : ['rejected', 'missed', 'expired'].indexOf(st) >= 0 ? 'ng' : '';
+    const edited = d.decision && d.decision.action === 'edit' && st === 'decided' ? '(修正して承認)' : '';
+    return '<tr><td>' + esc(scheduleLabel_(d)) + '</td><td><a href="' + esc(d.url) + '" target="_blank" rel="noopener">' + esc(d.title) + '</a></td><td class="' + cls + '">' + esc((STATE_LABELS[st] || st) + edited) + '</td></tr>';
+  }).join('');
+  return page_('7日分の状態', '<h1>7日分の投稿案の状態</h1><div class="notice">表示だけの画面です。判断は承認メールの「承認する」「修正する」「却下する」から行ってください。</div>' +
+    '<section class="panel"><table><tr><th>公開予定(日本時間)</th><th>商品</th><th>状態</th></tr>' + rows + '</table></section>');
+}
+
+function draftPageHtml_(d, key, intent) {
   const state = stateOf_(d);
   const open = OPEN_STATES.indexOf(state) >= 0;
   const record = {
@@ -729,17 +784,27 @@ function draftPageHtml_(d, key) {
     '<label class="rv-confirm-label"' + (manual ? '' : ' hidden') + '><input type="checkbox" id="publish-confirm"> 投稿先・本文・画像・商品URLを確認しました。この内容で今すぐ公開します</label>' +
     '<div class="review-actions final-actions"' + (manual ? '' : ' hidden') + '><button type="button" id="publish-btn" disabled>公開する</button></div>' +
     '<p class="meta" id="publish-msg"></p></section>';
-  const ctx = { d: d.id, k: key, final: d.state === 'decided' && open ? finalView_(d) : null, state: state };
+  const ctx = { d: d.id, k: key, final: d.state === 'decided' && open ? finalView_(d) : null, state: state, intent: intent || '' };
+  const INTENT_TEXT = { approve: '「承認する」', edit: '「修正する」', reject: '「却下する」' };
+  const intentBox = intent ? '<div class="notice" id="intent-box"><b>メールの' + INTENT_TEXT[intent] + 'から開きました。まだ確定していません。</b><br>' +
+    (!open ? 'この投稿案は「' + esc(STATE_LABELS[state] || state) + '」のため、判断はできません。'
+      : intent === 'approve' && state === 'decided' ? 'この投稿案はすでに承認済みです(下の「承認済みの内容」)。変更するときは「修正して承認」または「却下」を選んでください。'
+      : intent === 'approve' ? '内容を確かめて、下の「この判断で確定する」を押すと承認が確定します。'
+      : intent === 'edit' ? '下の編集欄で投稿文を直し、「この内容で修正して承認」→「この判断で確定する」で確定します。'
+      : '下で却下の理由を選び、「却下にする」→「この判断で確定する」で確定します。却下した投稿は公開しません。') + '</div>' : '';
   return '<h1>Facebook 投稿案の承認</h1>' +
     '<div class="notice">' + (manual
       ? 'この画面を開いただけでは何も変わりません。判断は「この判断で進む」で保存され、Facebook への投稿は最終確認で「公開する」を押したときだけ行います。却下した投稿案は投稿しません。'
-      : 'この画面を開いただけでは何も変わりません。判断は「この判断で進む」で保存されます。承認(修正して承認)した投稿案だけを ' + esc(sched) + ' に自動で公開します。却下した投稿案・予定時刻までに判断がない投稿案は公開しません。') + '</div>' +
-    status +
-    (open ? REVIEW_BAR_MAIL : '') +
-    card + finalBox +
+      : 'この画面を開いただけでは何も変わりません。判断は「この判断で確定する」を押したときだけ保存されます。承認(修正して承認)した投稿案だけを ' + esc(sched) + ' に自動で公開します。却下した投稿案・予定時刻までに判断がない投稿案は公開しません。') + '</div>' +
+    intentBox + status +
+    // メールのボタンから開いたときは、投稿の内容を先に見せてから確定の欄を出す
+    (intent ? card.replace(/不採用/g, '却下') : '') +
+    (open ? (manual ? REVIEW_BAR_MAIL : REVIEW_BAR_MAIL.replace(/この判断で進む/g, 'この判断で確定する')
+      .replace('承認した場合は、次の画面で最終的な投稿内容を確かめてから「公開する」を押したときだけ投稿します。', '承認(修正して承認)した投稿だけを、公開予定日時に自動で公開します。')).replace(/不採用/g, '却下') : '') +
+    (intent ? '' : card.replace(/不採用/g, '却下')) + finalBox +
     '<script type="application/json" id="fb-review-data">' + jsonForScript({ week: record.week, dataSource: 'live', pageId: APP.PAGE_ID, records: open ? [record] : [], mode: 'mail' }) + '</script>' +
     '<script type="application/json" id="mail-ctx">' + jsonForScript(ctx) + '</script>' +
-    (open ? '<script>' + REVIEW_SCRIPT + '</script>' : '') +
+    (open ? '<script>' + (manual ? REVIEW_SCRIPT : REVIEW_SCRIPT.replace(/この判断で進む/g, 'この判断で確定する')).replace("reject: '不採用'", "reject: '却下'").replace('・不採用 ', '・却下 ') + '</script>' : '') +
     '<script>' + MAIL_PAGE_SCRIPT_ + '</script>';
 }
 
@@ -861,6 +926,22 @@ const MAIL_PAGE_SCRIPT_ = `(() => {
     }).getStatus(CTX.d, CTX.k), 15000);
   }
   if (CTX.final) showFinal(CTX.final);
+  // メールのボタンから開いたとき: 操作の欄を開くだけ(確定は「この判断で確定する」を押したときだけ)
+  const widget = document.querySelector('.review[data-date]');
+  const press = sel => { const b = widget && widget.querySelector(sel); if (b && !b.disabled) b.click(); };
+  const openConfirm = () => { const b = $('#review-open-confirm'); if (b && !b.disabled) b.click(); };
+  if (widget && !(CTX.intent === 'approve' && CTX.state === 'decided')) {
+    if (CTX.intent === 'approve') { press('[data-act="approve"]'); openConfirm(); }
+    if (CTX.intent === 'edit') { press('[data-act="edit"]'); const t = widget.querySelector('.rv-body'); if (t) { widget.querySelector('.review-edit').scrollIntoView({ behavior: 'smooth' }); t.focus(); } }
+    if (CTX.intent === 'reject') { press('[data-act="reject"]'); widget.querySelector('.review-reject').scrollIntoView({ behavior: 'smooth' }); }
+  }
+  // 修正・却下を決めたら、そのまま確定の確認を開く
+  document.addEventListener('click', e => {
+    const b = e.target.closest('button');
+    if (!b || !widget) return;
+    if (b.dataset.act === 'edit-done' && widget.querySelector('.review-edit').hidden) openConfirm();
+    if (b.dataset.act === 'reject-done' && widget.querySelector('.review-reject').hidden) openConfirm();
+  });
   if (['publish_requested', 'publishing'].includes(CTX.state)) poll(0);
 })();`;
 

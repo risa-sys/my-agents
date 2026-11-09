@@ -5,6 +5,7 @@
  *
  *   BATCH_ID=<まとめID> DATES=2026-11-10,2026-11-11,... node scripts/fb-mail-reschedule.mjs
  *   DATES は今の公開予定の早い順に対応する新しい日付(件数も同じ)。
+ *   RESEND=1 BATCH_ID=<まとめID> … 日付は変えず、承認メールだけ送り直す(リンクは作り直す)
  *   必要: FB_MAIL_GAS_URL / FB_MAIL_SECRET。fb-history(data/fb-post-history.json)は読むだけ。
  */
 import { existsSync, readFileSync } from 'node:fs';
@@ -16,6 +17,7 @@ const FREE_STATUSES = ['candidate', 'rejected'];
 
 async function main() {
   const batchId = String(process.env.BATCH_ID || '').trim();
+  if (process.env.RESEND === '1') return resend(batchId);
   const dates = String(process.env.DATES || '').split(/[\s,]+/).filter(Boolean);
   if (!/^[0-9a-f]{32}$/.test(batchId)) throw new Error('BATCH_ID が不正です');
   if (!dates.length || dates.some(d => !/^\d{4}-\d{2}-\d{2}$/.test(d))) throw new Error('DATES が不正です(YYYY-MM-DD をカンマ区切り)');
@@ -40,7 +42,18 @@ async function main() {
   console.log('Facebook には何も送っていません。');
 }
 
+async function resend(batchId) {
+  if (!/^[0-9a-f]{32}$/.test(batchId)) throw new Error('BATCH_ID が不正です');
+  const url = process.env.FB_MAIL_GAS_URL;
+  const secret = process.env.FB_MAIL_SECRET;
+  if (!url || !secret) throw new Error('FB_MAIL_GAS_URL / FB_MAIL_SECRET がありません');
+  const res = await callGas({ url, secret, action: 'resendBatch', payload: { batchId } });
+  console.log(`### 承認メールを送り直しました(まとめID: ${batchId})`);
+  for (const it of res.items) console.log(`- ${it.postDate} 18:00(日本時間) … ${it.state}`);
+  console.log('Facebook には何も送っていません。');
+}
+
 main().catch(err => {
-  console.error('公開予定日を変更できませんでした: ' + err.message);
+  console.error((process.env.RESEND === '1' ? '承認メールを送り直せませんでした: ' : '公開予定日を変更できませんでした: ') + err.message);
   process.exit(1);
 });
