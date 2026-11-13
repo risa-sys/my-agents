@@ -13,7 +13,8 @@
  *             Facebookへは一切通信しない。必要: GEMINI_API_KEY
  *   check   … トークンとページの疎通だけ確認する(読み取りのみ)。必要: FB_PAGE_ACCESS_TOKEN
  *   draft   … 停止中。週次版の下書き保存が完成するまで使わない。
- *   mail-draft … メール承認の動作確認用。投稿案を1件だけ作り、署名つきで Apps Script(承認メール)へ送る。
+ *   mail-draft … 投稿案を COUNT 件(既定1・最大3)作り、1件ずつ署名つきで Apps Script(承認メール)へ送る。
+ *             承認を確定すると、Apps Script がその1件の即時公開(fb-mail-publish.yml)を起動する。
  *             投稿案は公開の GitHub(fb-history・ログ・成果物)には残さない(ログには「作った/作れなかった」だけを出す)。
  *             Facebookへは一切通信しない。必要: GEMINI_API_KEY / FB_MAIL_GAS_URL / FB_MAIL_SECRET
  *   mail-week … 7日分(1日1件・各日18:00公開予定)の投稿案を作り、まとめて Apps Script(承認メール1通)へ送る。
@@ -320,44 +321,65 @@ async function runMailDraft() {
   } catch (e) {
     throw Object.assign(e, { public: true });
   }
+  // 作る件数(既定1・最大3)。1件ごとに承認メールを1通送る(承認を確定すると、その1件をすぐ公開する)
+  const count = Number(process.env.COUNT || 1);
+  if (!Number.isInteger(count) || count < 1 || count > 3) throw Object.assign(new Error(`COUNT は 1〜3 にしてください(指定値: ${process.env.COUNT})`), { public: true });
   const today = todayJst();
+  const sent = [];
   try {
     const history = loadHistory();
+    const active = await callGas({ url: gasUrl, secret, action: 'activeProducts' });
     const blocked = new Set([
       ...history.entries.map(e => String(e.productId)),
       ...(history.testPosts || []).filter(t => t.result !== 'not_published').map(t => String(t.productId)),
-      ...(history.mailPosts || []).filter(t => t.result !== 'not_published').map(t => String(t.productId))
+      ...(history.mailPosts || []).filter(t => t.result !== 'not_published').map(t => String(t.productId)),
+      ...(active.productIds || []).map(String)
     ]);
-    const { pool, stats } = await collectProducts(blocked);
+    const { pool: allPool, stats } = await collectProducts(blocked);
+    // 名前がほぼ同じ商品は、使用済み・承認待ちのものと重ねず、今回の中でも1つだけにする
+    const usedTitles = [...history.entries.map(e => e.title), ...(active.titles || [])].filter(Boolean).map(titleCore);
+    const pool = [];
+    for (const p of allPool) {
+      const core = titleCore(p.title);
+      if ([...usedTitles, ...pool.map(x => titleCore(x.title))].some(t => similarTitle(core, t))) continue;
+      pool.push(p);
+    }
     const nextVerified = createVerifiedProductSource(pool, stats, []);
-    const product = await nextVerified();
-    if (!product) throw new Error('確認できた候補商品がありませんでした');
     const phrases = recentPhrases(history, '', []);
     const avoid = { openings: [...phrases.openings], closings: [...phrases.closings] };
-    const post = await generateForSlot(apiKey, { date: today, product, anniversary: null, assignReason: '', reserve: 0 }, nextVerified, avoid, []);
-    if (post.failed || post.needsReview || !post.ok) throw new Error(post.error || '投稿文がルール・事実確認に通りませんでした');
-    const p = post.product;
-    const source = { title: p.title, vendor: p.vendor, productType: p.productType, tags: p.tags, description: p.description };
-    const draft = {
-      productId: p.id, handle: p.handle, title: p.title, url: p.url, image: p.images[0], images: p.images,
-      message: post.message, originalHash: hashOf(post.message), postDate: today, generatedAt: new Date().toISOString(),
-      genre: p.genre, factCheck: 'passed'
-    };
-    log(`投稿案: ${p.title}(${p.id})`);
-    const reply = await callGas({ url: gasUrl, secret, action: 'createDraft', payload: { draft, source } });
+    const posts = [];
+    for (let i = 0; i < count; i++) {
+      const product = await nextVerified();
+      if (!product) throw new Error(`確認できた候補商品が足りませんでした(${sent.length}件まで送信)`);
+      const post = await generateForSlot(apiKey, { date: today, product, anniversary: null, assignReason: '', reserve: count - i - 1 }, nextVerified, avoid, posts);
+      if (post.failed || post.needsReview || !post.ok) throw new Error(`${post.error || '投稿文がルール・事実確認に通りませんでした'}(${sent.length}件まで送信)`);
+      avoid.openings.push(post.opening);
+      avoid.closings.push(post.closing);
+      posts.push(post);
+      const p = post.product;
+      const source = { title: p.title, vendor: p.vendor, productType: p.productType, tags: p.tags, description: p.description };
+      const draft = {
+        productId: p.id, handle: p.handle, title: p.title, url: p.url, image: p.images[0], images: p.images,
+        message: post.message, originalHash: hashOf(post.message), postDate: today, generatedAt: new Date().toISOString(),
+        genre: p.genre, factCheck: 'passed'
+      };
+      log(`投稿案: ${p.title}(${p.id})`);
+      const reply = await callGas({ url: gasUrl, secret, action: 'createDraft', payload: { draft, source } });
+      sent.push(reply.draftId);
+    }
     publicLog([
-      `### 投稿案を1件作り、承認メールを送りました(投稿案ID: ${reply.draftId})`,
+      `### 投稿案を${sent.length}件作り、承認メールを1件ずつ送りました(投稿案ID: ${sent.join(', ')})`,
       '投稿案の中身は、承認メールと承認画面でだけ確認できます(公開のログ・fb-history には残していません)。',
-      'Facebook にはまだ何も送っていません。',
+      '承認(修正して承認)を確定すると、その投稿をすぐ Facebook に公開します。Facebook にはまだ何も送っていません。',
       geminiUsageSummary()
     ].join('\n'));
   } catch (e) {
     quietLog.push(`エラー: ${e.message}`);
     try {
       await callGas({ url: gasUrl, secret, action: 'draftFailed', payload: { reason: e.message, detail: quietLog.slice(-80).join('\n') } });
-      publicLog('投稿案を作れませんでした。詳細は承認メールの宛先に送りました(Facebook には何も送っていません)。');
+      publicLog(`投稿案を作れませんでした(${sent.length}件は送信済み)。詳細は承認メールの宛先に送りました(Facebook には何も送っていません)。`);
     } catch (notice) {
-      publicLog(`投稿案を作れませんでした。詳細の連絡もできませんでした(${notice.message})。Facebook には何も送っていません。`);
+      publicLog(`投稿案を作れませんでした(${sent.length}件は送信済み)。詳細の連絡もできませんでした(${notice.message})。Facebook には何も送っていません。`);
     }
     throw e;
   }

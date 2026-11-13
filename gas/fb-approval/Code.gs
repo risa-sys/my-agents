@@ -4,7 +4,7 @@
  * 流れ:
  *   1. GitHub Actions(fb-mail-draft.yml)が投稿案を1件作り、署名つきでここ(/exec)に送る → 保存してメールで知らせる
  *   2. メールのリンクから承認画面(/dev。プロジェクトの所有者しか開けない)を開き、承認・修正して承認・却下を選ぶ
- *   3. 承認した場合は、最終的な投稿内容を確かめて「公開する」を押したときだけ、GitHub Actions(fb-mail-publish.yml)を起動する
+ *   3. 承認(修正して承認)を確定すると、すぐに GitHub Actions(fb-mail-publish.yml)を起動する(7日分の予定つき投稿案は予定日時に公開)
  *   4. fb-mail-publish.yml が署名つきで承認済みの内容を受け取り、Facebook に1件だけ公開して、結果を署名つきで知らせる
  *
  * 安全のしくみ:
@@ -598,11 +598,11 @@ function sendDraftMail_(d, key, cfg) {
     body: [
       'Facebook 投稿案の承認をお願いします(まだ投稿していません)。', '',
       '商品: ' + d.title, '商品URL: ' + d.url, '', '--- 投稿文 ---', d.message, '', '承認画面を開く: ' + link,
-      '(' + until + 'まで有効。画面を開いただけでは投稿されません)'
+      '(' + until + 'まで有効。画面を開いただけでは投稿されません。承認を確定すると、すぐに Facebook へ公開します)'
     ].join('\n'),
     htmlBody:
       '<div style="font-family:sans-serif;max-width:600px;line-height:1.6">' +
-      '<p>Facebook 投稿案の承認をお願いします(<b>まだ投稿していません</b>)。</p>' +
+      '<p>Facebook 投稿案の承認をお願いします(<b>まだ投稿していません</b>)。承認画面で承認を確定すると、<b>すぐに Facebook へ公開</b>します。</p>' +
       '<p><b>' + esc(d.title) + '</b><br><a href="' + esc(d.url) + '">' + esc(d.url) + '</a></p>' +
       '<p><img src="' + esc(imageUrl_(d.image, 600)) + '" alt="' + esc(d.title) + '" width="300" style="max-width:100%;height:auto;border-radius:6px"></p>' +
       '<div style="border:1px solid #ced0d4;border-radius:8px;padding:12px">' + messageHtml_(d.message, d.url) + '</div>' +
@@ -789,12 +789,12 @@ function draftPageHtml_(d, key, intent) {
   const intentBox = intent ? '<div class="notice" id="intent-box"><b>メールの' + INTENT_TEXT[intent] + 'から開きました。まだ確定していません。</b><br>' +
     (!open ? 'この投稿案は「' + esc(STATE_LABELS[state] || state) + '」のため、判断はできません。'
       : intent === 'approve' && state === 'decided' ? 'この投稿案はすでに承認済みです(下の「承認済みの内容」)。変更するときは「修正して承認」または「却下」を選んでください。'
-      : intent === 'approve' ? '内容を確かめて、下の「この判断で確定する」を押すと承認が確定します。'
+      : intent === 'approve' ? (manual ? '内容を確かめて、下の「この判断で進む」を押すと承認が確定し、すぐに Facebook へ公開します。' : '内容を確かめて、下の「この判断で確定する」を押すと承認が確定します。')
       : intent === 'edit' ? '下の編集欄で投稿文を直し、「この内容で修正して承認」→「この判断で確定する」で確定します。'
       : '下で却下の理由を選び、「却下にする」→「この判断で確定する」で確定します。却下した投稿は公開しません。') + '</div>' : '';
   return '<h1>Facebook 投稿案の承認</h1>' +
     '<div class="notice">' + (manual
-      ? 'この画面を開いただけでは何も変わりません。判断は「この判断で進む」で保存され、Facebook への投稿は最終確認で「公開する」を押したときだけ行います。却下した投稿案は投稿しません。'
+      ? 'この画面を開いただけでは何も変わりません。<b>承認(または修正して承認)を「この判断で進む」で確定すると、すぐに Facebook へ公開します。</b>却下した投稿案は投稿しません。'
       : 'この画面を開いただけでは何も変わりません。判断は「この判断で確定する」を押したときだけ保存されます。承認(修正して承認)した投稿案だけを ' + esc(sched) + ' に自動で公開します。却下した投稿案・予定時刻までに判断がない投稿案は公開しません。') + '</div>' +
     intentBox + status +
     // メールのボタンから開いたときは、投稿の内容を先に見せてから確定の欄を出す
@@ -890,8 +890,14 @@ const MAIL_PAGE_SCRIPT_ = `(() => {
           $('.review-saved').textContent = '却下として保存しました。この投稿案は投稿しません。';
           $('#final').hidden = true;
           lockDecision();
+        } else if (['publish_requested', 'publishing'].includes(r.state)) {
+          $('.review-saved').textContent = '承認しました。Facebook への公開を開始しました。数分で完了します(結果はこの画面とメールでお知らせします。この画面は閉じてもかまいません)。';
+          lockDecision();
+          poll(0);
         } else {
-          $('.review-saved').textContent = '判断を保存しました(まだ投稿していません)。下の最終確認で内容を確かめてください。';
+          $('.review-saved').textContent = r.publishError
+            ? '承認は保存しましたが、' + r.publishError + '。下の最終確認から「公開する」でもう一度試せます。'
+            : '判断を保存しました(まだ投稿していません)。下の最終確認で内容を確かめてください。';
           showFinal(r.final);
         }
       })
@@ -991,6 +997,24 @@ function submitDecision(id, key, file) {
     d.finalHash = contentHash_(d.productId, d.url, d.image, finalMessage);
     event_(d, d.decision.action === 'edit' ? '修正して承認しました' : '承認しました');
     saveDraft_(d);
+    // 予定日時の無い投稿案は、承認を確定したらそのまま公開を始める(公開前の確認は fb-mail-publish.yml がもう一度行う)
+    if (!d.scheduledAt) {
+      d.state = 'publish_requested';
+      d.requestedAt = Date.now();
+      delete d.result;
+      event_(d, '承認の確定により公開を開始しました');
+      saveDraft_(d);
+      try {
+        dispatchPublish_(cfg, d.id);
+      } catch (err) {
+        d.state = 'decided';
+        event_(d, '公開処理を起動できませんでした');
+        saveDraft_(d);
+        const v = statusView_(d);
+        v.publishError = 'GitHub の公開処理を起動できませんでした(投稿はしていません): ' + err.message;
+        return v;
+      }
+    }
     return statusView_(d);
   });
 }
