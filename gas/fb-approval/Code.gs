@@ -295,9 +295,10 @@ function apiCreateDraft_(req, cfg) {
     }
     const id = randomHex_();
     const key = randomHex_() + randomHex_();
+    const replyCode = randomHex_();
     const now = Date.now();
     const d = {
-      id: id, keyHash: sha256Hex_(key), state: 'awaiting', createdAt: now, expiresAt: now + APP.DRAFT_TTL_MS,
+      id: id, keyHash: sha256Hex_(key), replyHash: sha256Hex_(replyCode), state: 'awaiting', createdAt: now, expiresAt: now + APP.DRAFT_TTL_MS,
       productId: String(input.productId), handle: String(input.handle || ''), title: String(input.title), url: String(input.url),
       image: String(input.image), message: String(input.message), originalHash: String(input.originalHash),
       postDate: String(input.postDate), generatedAt: String(input.generatedAt || ''), genre: String(input.genre || ''),
@@ -307,7 +308,7 @@ function apiCreateDraft_(req, cfg) {
     saveDraft_(d);
     store_().setProperty('src:' + id, JSON.stringify(source));
     try {
-      sendDraftMail_(d, key, cfg);
+      sendDraftMail_(d, key, cfg, replyCode);
     } catch (err) {
       store_().deleteProperty('draft:' + id);
       store_().deleteProperty('src:' + id);
@@ -588,28 +589,199 @@ function imageUrl_(src, width) {
   return src + (src.indexOf('?') >= 0 ? '&' : '?') + 'width=' + width;
 }
 
-function sendDraftMail_(d, key, cfg) {
+function sendDraftMail_(d, key, cfg, replyCode) {
   const link = cfg.uiUrl + '?d=' + d.id + '&k=' + key;
   const until = Utilities.formatDate(new Date(d.expiresAt), 'Asia/Tokyo', 'M月d日 HH:mm');
+  const btn = (href, label, color) => '<a href="' + esc(href) + '" style="display:inline-block;background:' + color +
+    ';color:#fff;padding:12px 22px;border-radius:6px;text-decoration:none;font-weight:bold;margin:0 8px 8px 0">' + label + '</a>';
+  const buttons = replyCode
+    ? '<div style="margin-top:20px;padding:14px;background:#f0f2f5;border-radius:8px">' +
+      '<p style="margin:0 0 10px"><b>ボタンを押すと返信メールが開きます。そのまま「送信」すると確定します。</b></p>' +
+      btn(replyMailto_(cfg, d, replyCode, 'approve'), '✅ 承認する', '#1877f2') +
+      btn(replyMailto_(cfg, d, replyCode, 'edit'), '✏️ 修正する', '#6b7280') +
+      btn(replyMailto_(cfg, d, replyCode, 'reject'), '❌ 却下する', '#b42318') +
+      '<p style="margin:6px 0 0;font-size:13px;color:#4b4f56">承認: 送信すると数分以内に Facebook へ公開します。<br>' +
+      '修正: 返信メールの中の投稿文を直して送信すると、ルールのチェックに通ればその文で公開します(通らないときは理由をメールでお知らせします)。<br>' +
+      '却下: 送信すると投稿しません。<br>送信してから処理されるまで、最大5分ほどかかります。</p></div>'
+    : '';
   MailApp.sendEmail({
     to: cfg.owner,
     subject: '[ふくしま市場] 投稿案の承認のお願い: ' + d.title,
     name: 'ふくしま市場 投稿承認',
     body: [
       'Facebook 投稿案の承認をお願いします(まだ投稿していません)。', '',
-      '商品: ' + d.title, '商品URL: ' + d.url, '', '--- 投稿文 ---', d.message, '', '承認画面を開く: ' + link,
-      '(' + until + 'まで有効。画面を開いただけでは投稿されません。承認を確定すると、すぐに Facebook へ公開します)'
+      '商品: ' + d.title, '商品URL: ' + d.url, '', '--- 投稿文 ---', d.message, '',
+      'このメールを HTML 表示で開くと「承認する」「修正する」「却下する」のボタンがあります。', '承認画面を開く: ' + link,
+      '(' + until + 'まで有効。承認を確定すると、すぐに Facebook へ公開します)'
     ].join('\n'),
     htmlBody:
       '<div style="font-family:sans-serif;max-width:600px;line-height:1.6">' +
-      '<p>Facebook 投稿案の承認をお願いします(<b>まだ投稿していません</b>)。承認画面で承認を確定すると、<b>すぐに Facebook へ公開</b>します。</p>' +
+      '<p>Facebook 投稿案の承認をお願いします(<b>まだ投稿していません</b>)。承認すると、<b>すぐに Facebook へ公開</b>します。</p>' +
       '<p><b>' + esc(d.title) + '</b><br><a href="' + esc(d.url) + '">' + esc(d.url) + '</a></p>' +
       '<p><img src="' + esc(imageUrl_(d.image, 600)) + '" alt="' + esc(d.title) + '" width="300" style="max-width:100%;height:auto;border-radius:6px"></p>' +
       '<div style="border:1px solid #ced0d4;border-radius:8px;padding:12px">' + messageHtml_(d.message, d.url) + '</div>' +
-      '<p style="margin-top:20px"><a href="' + esc(link) + '" style="display:inline-block;background:#1877f2;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none;font-weight:bold">承認画面を開く</a></p>' +
+      buttons +
+      '<p style="margin-top:16px;font-size:13px">ボタンがうまく動かないときは <a href="' + esc(link) + '">承認画面を開く</a></p>' +
       '<p style="color:#65676b;font-size:13px">投稿先: ' + esc(APP.PAGE_NAME) + '(ページID ' + APP.PAGE_ID + ')<br>' +
-      'リンクの有効期限: ' + esc(until) + '<br>承認画面は、このプロジェクトの所有者の Google アカウントでログインしているときだけ開けます。画面を開いただけでは何も変わりません。<br>' +
-      'このメールを転送しないでください(リンクに承認用の鍵が含まれています)。</p></div>'
+      '有効期限: ' + esc(until) + '<br>' +
+      'このメールを転送しないでください(ボタンとリンクに承認用のコードが含まれています)。</p></div>'
+  });
+}
+
+// ---------------------------------------------------------------------------
+// メールの返信で判断する(承認メールのボタン → 返信メール → 送信)
+// ボタンはメールアプリの返信を開くだけ(リンクが自動で開かれても、メールは送られないので何も起きない)。
+// 5分ごとの処理(processReplies)が、自分のアドレスから届いた・投稿案ごとのコードが合う返信だけを受け付ける
+// ---------------------------------------------------------------------------
+
+const REPLY_ = {
+  SUBJECT_TAG: '[FB承認]',
+  CODE_LABEL: 'FB承認コード',
+  MARK: '=====',
+  SEARCH_DAYS: 4,
+  DONE_KEY: 'replyDone', // 処理した返信のメッセージID(同じ返信を二度処理しない)
+  MAX_DONE: 300
+};
+const REPLY_ACTION_LABELS_ = { approve: '承認', edit: '修正', reject: '却下' };
+const REPLY_CODE_RE_ = /FB承認コード\s*[:：]\s*(approve|edit|reject)-([0-9a-f]{32})-([0-9a-f]{32})/;
+
+function replyMailto_(cfg, d, code, action) {
+  const subject = REPLY_.SUBJECT_TAG + ' ' + REPLY_ACTION_LABELS_[action] + ': ' + d.title.slice(0, 40);
+  const codeLine = REPLY_.CODE_LABEL + ': ' + action + '-' + d.id + '-' + code + '(この行は消さないでください)';
+  const lines = action === 'approve' ? ['このまま送信すると承認し、すぐに Facebook へ公開します。', '', codeLine]
+    : action === 'reject' ? ['このまま送信すると却下します(投稿しません)。', '', codeLine]
+    : ['下の ' + REPLY_.MARK + ' と ' + REPLY_.MARK + ' の間の投稿文を直して、送信してください。',
+      'チェックに通れば、その文ですぐに Facebook へ公開します。',
+      '(「' + RULES.DETAIL_LABEL + '」・商品URL・ハッシュタグの行は残してください。商品情報にない事実は書き足さないでください)', '',
+      REPLY_.MARK, d.message, REPLY_.MARK, '', codeLine];
+  return 'mailto:' + cfg.owner + '?subject=' + encodeURIComponent(subject) + '&body=' + encodeURIComponent(lines.join('\r\n'));
+}
+
+/** 5分ごとに実行する: 返信を探して判断を保存する(承認なら公開を始める) */
+function processReplies() {
+  const cfg = config_();
+  if (!cfg.owner) return;
+  const props = store_();
+  let done = JSON.parse(props.getProperty(REPLY_.DONE_KEY) || '[]');
+  const query = 'newer_than:' + REPLY_.SEARCH_DAYS + 'd from:(' + cfg.owner + ') {subject:"FB承認" "' + REPLY_.CODE_LABEL + '"}';
+  const threads = GmailApp.search(query, 0, 50);
+  for (const thread of threads) {
+    for (const msg of thread.getMessages()) {
+      const mid = msg.getId();
+      if (done.indexOf(mid) >= 0) continue;
+      const body = String(msg.getPlainBody() || '');
+      const m = body.match(REPLY_CODE_RE_);
+      if (!m) continue;
+      // 先に「処理済み」にする(失敗しても同じ返信で二度公開しない)
+      done = done.concat([mid]).slice(-REPLY_.MAX_DONE);
+      props.setProperty(REPLY_.DONE_KEY, JSON.stringify(done));
+      if (!sameAddress_(msg.getFrom(), cfg.owner)) continue;
+      let d = null;
+      try {
+        const r = withLock_(() => handleReply_(m[1], m[2], m[3], body, cfg));
+        d = r.d;
+        sendReplyAck_(cfg, r.d, m[1], r.view);
+      } catch (err) {
+        sendReplyError_(cfg, d || loadDraft_(m[2]), m[1], err.message);
+      }
+    }
+  }
+}
+
+function sameAddress_(from, owner) {
+  const m = String(from || '').match(/<([^>]+)>/);
+  return String(m ? m[1] : from).trim().toLowerCase() === owner;
+}
+
+function handleReply_(action, id, code, body, cfg) {
+  const d = loadDraft_(id);
+  if (!d || !d.replyHash || !safeEqual_(sha256Hex_(code), d.replyHash)) throw new Error('承認コードが一致しません(新しい承認メールのボタンから送ってください)');
+  const dec = { action: action, productId: d.productId, originalHash: d.originalHash, postDate: d.postDate };
+  if (action === 'reject') {
+    dec.reason = 'その他';
+    dec.note = 'メールの返信で却下';
+  } else if (action === 'edit') {
+    const lines = body.replace(/\r\n?/g, '\n').split('\n');
+    const marks = [];
+    lines.forEach((line, i) => { if (line.trim() === REPLY_.MARK) marks.push(i); });
+    if (marks.length < 2) throw new Error('投稿文の範囲(' + REPLY_.MARK + ' の行)が見つかりません。2つの ' + REPLY_.MARK + ' の行は消さないでください');
+    const text = normalizeMessage(lines.slice(marks[0] + 1, marks[1]).join('\n'));
+    if (text === normalizeMessage(d.message)) {
+      dec.action = 'approve';
+    } else {
+      const parts = splitMessage(text);
+      if (parts.url !== d.url) throw new Error('「' + RULES.DETAIL_LABEL + '」と商品URLの行が見つからないか、変わっています。この2行はそのまま残してください');
+      dec.body = parts.body;
+      dec.hashtags = parts.hashtags.filter(t => RULES.FIXED_HASHTAGS.indexOf(t) < 0);
+      dec.confirmNoNewFacts = true; // 返信メールの案内で「商品情報にない事実は書き足さない」ことを伝えている
+    }
+  }
+  const view = applyDecision_(d, dec, cfg);
+  event_(d, 'メールの返信で判断しました(' + REPLY_ACTION_LABELS_[action] + ')');
+  saveDraft_(d);
+  return { d: d, view: view };
+}
+
+function sendReplyAck_(cfg, d, action, view) {
+  const text = view.state === 'rejected' ? '却下しました。この投稿は Facebook に投稿しません。'
+    : ['publish_requested', 'publishing'].indexOf(view.state) >= 0 ? (action === 'edit' ? '修正した内容で承認しました。' : '承認しました。') + 'Facebook への公開を開始しました。数分後に結果のメールが届きます。'
+    : view.publishError ? '承認は保存しましたが、' + view.publishError + '。承認画面から「公開する」でもう一度試せます。'
+    : '判断を保存しました(' + (STATE_LABELS[view.state] || view.state) + ')。';
+  MailApp.sendEmail({
+    to: cfg.owner,
+    subject: '[ふくしま市場] 返信を受け付けました(' + REPLY_ACTION_LABELS_[action] + '): ' + d.title,
+    name: 'ふくしま市場 投稿承認',
+    body: text + '\n\n商品: ' + d.title + '\n商品URL: ' + d.url + (d.finalMessage ? '\n\n--- 公開する投稿文 ---\n' + d.finalMessage : '')
+  });
+}
+
+function sendReplyError_(cfg, d, action, reason) {
+  MailApp.sendEmail({
+    to: cfg.owner,
+    subject: '[ふくしま市場] 返信を処理できませんでした(' + (REPLY_ACTION_LABELS_[action] || action) + ')' + (d ? ': ' + d.title : ''),
+    name: 'ふくしま市場 投稿承認',
+    body: ['返信を処理できませんでした。Facebook には投稿していません。', '', '理由: ' + reason, '',
+      '直してから、承認メールのボタンからもう一度送ってください(承認画面から判断することもできます)。'].join('\n')
+  });
+}
+
+/** 初回だけエディタで実行する: 返信の確認(processReplies)を5分ごとに動かし、判断待ちの承認メールをボタンつきで送り直す。Gmail を読む許可を求められたら許可する */
+function setupReplyTrigger() {
+  ScriptApp.getProjectTriggers().filter(t => t.getHandlerFunction() === 'processReplies').forEach(t => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger('processReplies').timeBased().everyMinutes(5).create();
+  GmailApp.search('newer_than:1d', 0, 1); // Gmail の許可をここで確認する
+  Logger.log('返信の確認を5分ごとに動かすように設定しました');
+  resendOpenDraftMails(); // 判断待ちの投稿案があれば、ボタンつきの承認メールを送り直す
+}
+
+/**
+ * 判断待ちの投稿案(予定日時なし)の承認メールを、ボタンつきで送り直す(承認画面のリンクとコードは作り直す。古いメールは使えなくなる)。
+ * setupReplyTrigger から呼ぶ(エディタで単独で実行してもよい)
+ */
+function resendOpenDraftMails() {
+  const cfg = config_();
+  return withLock_(() => {
+    const out = [];
+    for (const id of draftIds_()) {
+      const d = loadDraft_(id);
+      if (!d || d.scheduledAt || stateOf_(d) !== 'awaiting') continue;
+      const key = randomHex_() + randomHex_();
+      const replyCode = randomHex_();
+      const backup = JSON.stringify(d);
+      d.keyHash = sha256Hex_(key);
+      d.replyHash = sha256Hex_(replyCode);
+      event_(d, '承認メールを送り直しました(ボタンつき・リンクとコードを作り直しました)');
+      saveDraft_(d);
+      try {
+        sendDraftMail_(d, key, cfg, replyCode);
+      } catch (err) {
+        saveDraft_(JSON.parse(backup));
+        throw err;
+      }
+      out.push({ draftId: d.id, title: d.title });
+    }
+    Logger.log('送り直した承認メール: ' + out.length + '件');
+    return out;
   });
 }
 
@@ -959,11 +1131,21 @@ function submitDecision(id, key, file) {
   return withLock_(() => {
     const d = authorizeDraft_(id, key);
     if (!d) throw new Error('リンクが無効です');
+    const dec = file && file.kind === 'fb-decisions' && file.version === 1 && Array.isArray(file.decisions) && file.decisions.length === 1 ? file.decisions[0] : null;
+    if (!dec) throw new Error('判断の形式が不正です');
+    return applyDecision_(d, dec, cfg);
+  });
+}
+
+/**
+ * 判断(承認・修正して承認・却下)を保存する。承認画面とメールの返信の両方から使う(呼び出し側でロックと鍵の確認をすること)。
+ * 予定日時の無い投稿案は、承認を確定したらそのまま公開を始める
+ */
+function applyDecision_(d, dec, cfg) {
+  {
     const state = stateOf_(d);
     if (OPEN_STATES.indexOf(state) < 0) throw new Error('この投稿案はもう判断を変えられません(' + (STATE_LABELS[state] || state) + ')');
     if (d.scheduledAt && Date.now() >= d.scheduledAt - APP.SCHEDULE_EARLY_MS) throw new Error('公開予定時刻を過ぎたため、判断を変えられません');
-    const dec = file && file.kind === 'fb-decisions' && file.version === 1 && Array.isArray(file.decisions) && file.decisions.length === 1 ? file.decisions[0] : null;
-    if (!dec) throw new Error('判断の形式が不正です');
     if (String(dec.productId) !== d.productId || dec.originalHash !== d.originalHash || dec.postDate !== d.postDate) throw new Error('判断の対象がこの投稿案と一致しません');
     const decidedAt = new Date().toISOString();
     if (dec.action === 'reject') {
@@ -1016,7 +1198,7 @@ function submitDecision(id, key, file) {
       }
     }
     return statusView_(d);
-  });
+  }
 }
 
 function requestPublish(id, key, hash) {
