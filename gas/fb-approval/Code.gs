@@ -249,6 +249,7 @@ function handleApi_(req, cfg) {
   if (req.action === 'claimScheduled') return apiClaimScheduled_(req, cfg);
   if (req.action === 'reschedule') return apiReschedule_(req, cfg);
   if (req.action === 'resendBatch') return apiResendBatch_(req, cfg);
+  if (req.action === 'resendDrafts') return { ok: true, items: resendOpenDraftMails() };
   throw apiError_('不明な要求です', 'unknown_action');
 }
 
@@ -596,13 +597,12 @@ function sendDraftMail_(d, key, cfg, replyCode) {
     ';color:#fff;padding:12px 22px;border-radius:6px;text-decoration:none;font-weight:bold;margin:0 8px 8px 0">' + label + '</a>';
   const buttons = replyCode
     ? '<div style="margin-top:20px;padding:14px;background:#f0f2f5;border-radius:8px">' +
-      '<p style="margin:0 0 10px"><b>ボタンを押すと返信メールが開きます。そのまま「送信」すると確定します。</b></p>' +
-      btn(replyMailto_(cfg, d, replyCode, 'approve'), '✅ 承認する', '#1877f2') +
+      btn(link + '&do=approve', '✅ 承認する', '#1877f2') +
       btn(replyMailto_(cfg, d, replyCode, 'edit'), '✏️ 修正する', '#6b7280') +
-      btn(replyMailto_(cfg, d, replyCode, 'reject'), '❌ 却下する', '#b42318') +
-      '<p style="margin:6px 0 0;font-size:13px;color:#4b4f56">承認: 送信すると数分以内に Facebook へ公開します。<br>' +
-      '修正: 返信メールの中の投稿文を直して送信すると、ルールのチェックに通ればその文で公開します(通らないときは理由をメールでお知らせします)。<br>' +
-      '却下: 送信すると投稿しません。<br>送信してから処理されるまで、最大5分ほどかかります。</p></div>'
+      btn(link + '&do=reject', '❌ 却下する', '#b42318') +
+      '<p style="margin:6px 0 0;font-size:13px;color:#4b4f56"><b>承認</b>: 押すだけで確定し、すぐに Facebook へ公開します(取り消しはできません)。<br>' +
+      '<b>修正</b>: 返信メールが開きます。中の投稿文を直して送信すると、ルールのチェックに通ればその文で公開します(処理まで最大5分。通らないときは理由をメールでお知らせします)。<br>' +
+      '<b>却下</b>: 押すだけで確定し、投稿しません。</p></div>'
     : '';
   MailApp.sendEmail({
     to: cfg.owner,
@@ -895,7 +895,44 @@ function doGet(e) {
   const intent = ['approve', 'edit', 'reject'].indexOf(p.a) >= 0 ? p.a : '';
   const d = authorizeDraft_(p.d, p.k);
   if (!d) return page_('リンクが無効です', '<p class="ng">リンクが無効です(投稿案が見つからないか、リンクの鍵が一致しません)。</p>');
+  // メールの「承認する」「却下する」ボタン: 押すだけで確定する(予定日時の無い投稿案だけ。所有者のログインと鍵は上で確認済み)
+  if ((p.do === 'approve' || p.do === 'reject') && !d.scheduledAt) return quickDecision_(d.id, p.k, p.do, cfg);
   return page_('投稿案の承認', draftPageHtml_(d, p.k, intent));
+}
+
+function quickDecision_(id, key, action, cfg) {
+  let view = null;
+  let error = '';
+  try {
+    view = withLock_(() => {
+      const d = authorizeDraft_(id, key);
+      if (!d) throw new Error('リンクが無効です');
+      const dec = { action: action, productId: d.productId, originalHash: d.originalHash, postDate: d.postDate };
+      if (action === 'reject') {
+        dec.reason = 'その他';
+        dec.note = 'メールのボタンで却下';
+      }
+      const v = applyDecision_(d, dec, cfg);
+      event_(d, 'メールのボタンで判断しました(' + (action === 'approve' ? '承認' : '却下') + ')');
+      saveDraft_(d);
+      return v;
+    });
+  } catch (err) {
+    error = err.message;
+  }
+  const d = loadDraft_(id);
+  const state = d ? stateOf_(d) : '';
+  const head = error ? '判断できませんでした'
+    : view.state === 'rejected' ? '却下しました'
+    : ['publish_requested', 'publishing'].indexOf(view.state) >= 0 ? '承認しました。Facebook への公開を開始しました'
+    : '承認しました(まだ公開していません)';
+  const detail = error ? esc(error) + '<br>今の状態: ' + esc(STATE_LABELS[state] || state)
+    : view.state === 'rejected' ? 'この投稿は Facebook に投稿しません。'
+    : view.publishError ? esc(view.publishError) + '<br>下の承認画面から「公開する」でもう一度試せます。'
+    : '数分で完了します。結果はメールでお知らせします。この画面は閉じてもかまいません。';
+  return page_(head, '<h1>' + esc(head) + '</h1>' + (d ? '<p><b>' + esc(d.title) + '</b></p>' : '') +
+    '<div class="notice">' + detail + '</div>' +
+    '<p><a href="' + esc(cfg.uiUrl + '?d=' + id + '&k=' + key) + '">承認画面で状態を見る</a></p>');
 }
 
 function finalView_(d) {

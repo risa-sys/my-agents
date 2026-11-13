@@ -4,7 +4,8 @@ name: Facebook mail approval - draft (fukushima-ichiba)
 # - kind=week … 7日分(1日1件・各日18:00公開予定)をまとめて送る(承認メール1通)。start_date 空欄なら自動で決める
 # - kind=three … 3件を作り、承認メールを1件ずつ送る(承認を確定すると、その1件をすぐ公開)
 # - kind=one  … 1件だけ送る(承認を確定すると、すぐ公開)
-# - kind=resend … 送った7日分の承認メールを送り直す(batch_id。内容・日付・判断はそのまま、リンクは作り直す)
+# - kind=resend … 送った7日分の承認メールを送り直す(batch_id。内容・日付・判断はそのまま、リンクは作り直す)。
+#                 batch_id 空欄なら、判断待ちの1件ずつの承認メールを送り直す
 # - kind=reschedule … 送った7日分の公開予定日を変える(batch_id と dates)。内容・判断はそのまま、承認メールを送り直す
 # - 手動実行のみ(schedule なし)。このワークフローは Facebook へは一切通信しない(公開は承認後に fb-mail-publish.yml)
 # - 承認前の投稿案は、公開のログ・成果物・fb-history に残さない(ログには投稿案IDと成否だけ)

@@ -6,6 +6,7 @@
  *   BATCH_ID=<まとめID> DATES=2026-11-10,2026-11-11,... node scripts/fb-mail-reschedule.mjs
  *   DATES は今の公開予定の早い順に対応する新しい日付(件数も同じ)。
  *   RESEND=1 BATCH_ID=<まとめID> … 日付は変えず、承認メールだけ送り直す(リンクは作り直す)
+ *   RESEND=1(BATCH_ID なし) … 判断待ちの1件ずつの投稿案の承認メールを送り直す(リンクは作り直す)
  *   必要: FB_MAIL_GAS_URL / FB_MAIL_SECRET。fb-history(data/fb-post-history.json)は読むだけ。
  */
 import { existsSync, readFileSync } from 'node:fs';
@@ -43,6 +44,7 @@ async function main() {
 }
 
 async function resend(batchId) {
+  if (!batchId) return resendDrafts();
   if (!/^[0-9a-f]{32}$/.test(batchId)) throw new Error('BATCH_ID が不正です');
   const url = process.env.FB_MAIL_GAS_URL;
   const secret = process.env.FB_MAIL_SECRET;
@@ -50,6 +52,16 @@ async function resend(batchId) {
   const res = await callGas({ url, secret, action: 'resendBatch', payload: { batchId } });
   console.log(`### 承認メールを送り直しました(まとめID: ${batchId})`);
   for (const it of res.items) console.log(`- ${it.postDate} 18:00(日本時間) … ${it.state}`);
+  console.log('Facebook には何も送っていません。');
+}
+
+/** まとめIDなし: 判断待ちの投稿案(予定日時なし)の承認メールを、ボタンつきで送り直す */
+async function resendDrafts() {
+  const url = process.env.FB_MAIL_GAS_URL;
+  const secret = process.env.FB_MAIL_SECRET;
+  if (!url || !secret) throw new Error('FB_MAIL_GAS_URL / FB_MAIL_SECRET がありません');
+  const res = await callGas({ url, secret, action: 'resendDrafts' });
+  console.log(`### 判断待ちの承認メールを送り直しました(${res.items.length}件・投稿案ID: ${res.items.map(x => x.draftId).join(', ') || 'なし'})`);
   console.log('Facebook には何も送っていません。');
 }
 
