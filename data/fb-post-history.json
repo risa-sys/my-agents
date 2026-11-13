@@ -343,5 +343,15 @@
       "permalink": "https://www.facebook.com/1569071771906618/posts/1569071758573286",
       "publishedAt": "2026-11-09T12:08:33+09:00"
     }
+  ],
+  "mailPosts": [
+    {
+      "at": "2026-11-13T20:31:09+09:00",
+      "hash": "725acf024ee6997f",
+      "productId": "15450573439089",
+      "pageId": "277404605612561",
+      "draftId": "e5c762358809406093d75738bf5f76c7",
+      "result": "publishing"
+    }
   ]
 }
